@@ -8,7 +8,6 @@
     <owners>$author$</owners>
     <requireLicenseAcceptance>false</requireLicenseAcceptance>
     <license type="expression">MIT</license>
-    <projectUrl>http://www.eeip-library.de</projectUrl>
     <description>$description$</description>
     <releaseNotes>First NuGet Release</releaseNotes>
     <copyright>Copyright 2020</copyright>
