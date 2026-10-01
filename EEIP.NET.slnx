@@ -1,4 +1,7 @@
 <Solution>
+  <Folder Name="/tests/">
+    <Project Path="tests/EEIP.NET.Tests/EEIP.NET.Tests.csproj" />
+  </Folder>
   <Project Path="AllenBradleyPointIO/Allen Bradley Point IO_Implicit.csproj" />
   <Project Path="ConsoleApplication1/ConsoleApplication1.csproj" />
   <Project Path="DiscoverDevices/DiscoverDevices.csproj" />

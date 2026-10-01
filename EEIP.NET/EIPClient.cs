@@ -609,7 +609,7 @@ namespace Sres.Net.EEIP
                 return t_o_detectedLength;
         }
 
-        private static UInt32 GetMulticastAddress(UInt32 deviceIPAddress)
+        internal static UInt32 GetMulticastAddress(UInt32 deviceIPAddress)
         {
             UInt32 cip_Mcast_Base_Addr = 0xEFC00100;
             UInt32 cip_Host_Mask = 0x3FF;
@@ -1206,7 +1206,7 @@ namespace Sres.Net.EEIP
         /// <param name="instanceID">Requested Instance ID</param>
         /// <param name="attributeID">Requested Attribute ID - if "0" the attribute will be ignored</param>
         /// <returns>Encrypted Request Path</returns>
-        private byte[] GetEPath(int classID, int instanceID, int attributeID)
+        internal static byte[] GetEPath(int classID, int instanceID, int attributeID)
         {
             int byteCount = 0;
             if (classID < 0xff)
