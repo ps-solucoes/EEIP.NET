@@ -1,0 +1,14 @@
+<Solution>
+  <Project Path="AllenBradleyPointIO/Allen Bradley Point IO_Implicit.csproj" />
+  <Project Path="ConsoleApplication1/ConsoleApplication1.csproj" />
+  <Project Path="DiscoverDevices/DiscoverDevices.csproj" />
+  <Project Path="EEIP.NET/EEIP.csproj" />
+  <Project Path="Explicit_Message_Example2/Wago_750_352_Explicit2.csproj" />
+  <Project Path="Explicit_Message_Example_ReadAnalogInput/Wago_750_352_Explicit.csproj" />
+  <Project Path="Explicit_Messaging_Example/Wago_750_352_Explicit3.csproj" />
+  <Project Path="Fanuc_R30iA/Fanuc_R30iA.csproj" />
+  <Project Path="Fanuc_R30iA_Implicit/Fanuc_R30iA_Implicit.csproj" />
+  <Project Path="Keyence-NU_EP1_Implicit2/Keyence_NU_EP1_Implicit2.csproj" />
+  <Project Path="Keyence_NU_RP1_Implicit/Keyence_NU_EP1_Implicit3.csproj" />
+  <Project Path="Turck FEN20/Turck FEN20_Implicit.csproj" />
+</Solution>
