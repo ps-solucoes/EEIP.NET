@@ -37,6 +37,20 @@ public sealed class FakeEipTarget : IDisposable
 
     public Func<CipRequest, CipReply> Handler { get; set; } = _ => CipReply.Ok();
 
+    /// <summary>
+    /// When set, the returned bytes are sent verbatim as the reply to a SendRRData request instead of the frame
+    /// built from <see cref="Handler"/>. Return null to fall back to <see cref="Handler"/>.
+    /// </summary>
+    public Func<CipRequest, byte[]?>? RawReply { get; set; }
+
+    /// <summary>
+    /// Offsets into each reply frame (RegisterSession and SendRRData) at which the frame is cut into separate TCP
+    /// writes, <see cref="ChunkDelay"/> apart. TCP is a byte stream, so a conforming originator must cope.
+    /// </summary>
+    public int[] SplitReplyAt { get; set; } = [];
+
+    public TimeSpan ChunkDelay { get; set; } = TimeSpan.FromMilliseconds(50);
+
     public ConcurrentQueue<CipRequest> Requests { get; } = new();
 
     public ConcurrentQueue<byte[]> RegisterSessionFrames { get; } = new();
@@ -61,6 +75,7 @@ public sealed class FakeEipTarget : IDisposable
     private async Task ServeAsync(TcpClient client)
     {
         using var _ = client;
+        client.NoDelay = true;
         var stream = client.GetStream();
         var header = new byte[24];
         try
@@ -80,7 +95,7 @@ public sealed class FakeEipTarget : IDisposable
                         RegisterSessionFrames.Enqueue(frame);
                         var reply = (byte[])frame.Clone();
                         BinaryPrimitives.WriteUInt32LittleEndian(reply.AsSpan(4), SessionHandle);
-                        await stream.WriteAsync(reply, cts.Token);
+                        await WriteReplyAsync(stream, reply, cts.Token);
                         break;
                     case 0x66: // UnRegisterSession: no reply, target closes
                         Interlocked.Increment(ref UnRegisterSessionCount);
@@ -88,7 +103,8 @@ public sealed class FakeEipTarget : IDisposable
                     case 0x6F: // SendRRData
                         var request = ParseCipRequest(frame);
                         Requests.Enqueue(request);
-                        await stream.WriteAsync(BuildSendRRDataReply(request.Service, Handler(request)), cts.Token);
+                        var bytes = RawReply?.Invoke(request) ?? BuildSendRRDataReply(request.Service, Handler(request));
+                        await WriteReplyAsync(stream, bytes, cts.Token);
                         break;
                     default:
                         return;
@@ -101,6 +117,19 @@ public sealed class FakeEipTarget : IDisposable
         catch (ObjectDisposedException) { }
     }
 
+    private async Task WriteReplyAsync(NetworkStream stream, byte[] frame, CancellationToken token)
+    {
+        int start = 0;
+        foreach (int at in SplitReplyAt.Where(at => at > 0 && at < frame.Length).Order())
+        {
+            await stream.WriteAsync(frame.AsMemory(start, at - start), token);
+            await stream.FlushAsync(token);
+            await Task.Delay(ChunkDelay, token);
+            start = at;
+        }
+        await stream.WriteAsync(frame.AsMemory(start), token);
+    }
+
     private static CipRequest ParseCipRequest(byte[] frame)
     {
         // 24 encapsulation header + 4 interface handle + 2 timeout + CPF:
@@ -111,7 +140,7 @@ public sealed class FakeEipTarget : IDisposable
         return new CipRequest(cip[0], cip.Slice(2, pathBytes).ToArray(), cip[(2 + pathBytes)..].ToArray(), frame);
     }
 
-    public static byte[] BuildSendRRDataReply(byte requestService, CipReply reply, byte[]? extraItems = null, ushort extraItemCount = 0)
+    public static byte[] BuildSendRRDataReply(byte requestService, CipReply reply, byte[]? extraItems = null, ushort extraItemCount = 0, uint encapsulationStatus = 0)
     {
         var additional = reply.AdditionalStatus ?? [];
         int cipLength = 4 + additional.Length + reply.Data.Length;
@@ -122,6 +151,7 @@ public sealed class FakeEipTarget : IDisposable
         BinaryPrimitives.WriteUInt16LittleEndian(span, 0x6F);
         BinaryPrimitives.WriteUInt16LittleEndian(span[2..], (ushort)(frame.Length - 24));
         BinaryPrimitives.WriteUInt32LittleEndian(span[4..], SessionHandle);
+        BinaryPrimitives.WriteUInt32LittleEndian(span[8..], encapsulationStatus);
         BinaryPrimitives.WriteUInt16LittleEndian(span[30..], (ushort)(2 + extraItemCount));
         BinaryPrimitives.WriteUInt16LittleEndian(span[36..], 0xB2);
         BinaryPrimitives.WriteUInt16LittleEndian(span[38..], (ushort)cipLength);
