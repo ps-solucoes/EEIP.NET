@@ -4,8 +4,6 @@
     <RootNamespace>Sres.Networking.Eeip.Library</RootNamespace>
     <IsAotCompatible>true</IsAotCompatible>
     <Version>1.6.0</Version>
-    <Authors>Stefan Rossmann Engineering Solutions</Authors>
-    <Company>Stefan Rossmann Engineering Solutions</Company>
     <Product>EEIP.NET</Product>
     <Description>Ethernet/IP</Description>
     <Copyright>Copyright © 2018-2020</Copyright>
