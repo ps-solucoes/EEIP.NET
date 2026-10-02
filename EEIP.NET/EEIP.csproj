@@ -15,11 +15,29 @@
     <PublishRepositoryUrl>true</PublishRepositoryUrl>
     <IncludeSymbols>true</IncludeSymbols>
     <SymbolPackageFormat>snupkg</SymbolPackageFormat>
+
+    <!-- The test project needs internals; released builds must not ship the attribute: the
+         assembly is unsigned, so any assembly can claim that name and reach internals.
+         CI and the publish workflow pass -p:ExposeInternalsToTests=false when packing. -->
+    <ExposeInternalsToTests Condition="'$(ExposeInternalsToTests)' == ''">true</ExposeInternalsToTests>
+    <!-- `dotnet pack` sets _IsPacking and GeneratePackageOnBuild packs during the build; both are
+         evaluated before the compile, so the assembly is built without the attribute. -->
+    <ExposeInternalsToTests Condition="'$(_IsPacking)' == 'true' Or '$(GeneratePackageOnBuild)' == 'true'">false</ExposeInternalsToTests>
   </PropertyGroup>
-  <ItemGroup>
+  <ItemGroup Condition="'$(ExposeInternalsToTests)' == 'true'">
     <InternalsVisibleTo Include="EEIP.NET.Tests" />
   </ItemGroup>
   <ItemGroup>
     <None Remove="LabView Example\**;Notes\**" />
   </ItemGroup>
+
+  <!-- Backstop for pack paths the conditions above cannot reach (msbuild -t:Pack, Visual Studio's
+       Pack, an explicit -p:ExposeInternalsToTests=true): by then the assembly is compiled with the
+       attribute, so refuse instead of producing a leaky package. -->
+  <Target Name="RefuseToPackWithInternalsExposed"
+          BeforeTargets="Pack;GenerateNuspec"
+          Condition="'$(ExposeInternalsToTests)' == 'true'">
+    <Error Code="EEIP0001"
+           Text="Refusing to pack: ExposeInternalsToTests is 'true', so the package would ship InternalsVisibleTo for the test project in an unsigned assembly. Pass -p:ExposeInternalsToTests=false to pack." />
+  </Target>
 </Project>

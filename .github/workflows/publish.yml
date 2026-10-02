@@ -48,13 +48,19 @@ jobs:
       - name: Test
         run: dotnet test EEIP.NET.slnx -c Release --no-build
 
+      # Not --no-build: the tested build carries InternalsVisibleTo for the test project, so the
+      # library is recompiled without it for the package.
       - name: Pack
         run: |
-          dotnet pack "$PROJECT" -c Release --no-build \
+          dotnet pack "$PROJECT" -c Release --no-restore \
             -p:Version="$VERSION" \
             -p:ContinuousIntegrationBuild=true \
+            -p:ExposeInternalsToTests=false \
             -o "$RUNNER_TEMP/nupkg"
           ls -l "$RUNNER_TEMP/nupkg"
+
+      - name: Verify package contents
+        run: .github/scripts/verify-package.sh "$RUNNER_TEMP/nupkg"
 
       - name: Push package to GitHub Packages
         env:
