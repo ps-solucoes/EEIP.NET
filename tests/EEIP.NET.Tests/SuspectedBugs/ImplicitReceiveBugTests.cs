@@ -20,16 +20,14 @@ public sealed class ImplicitReceiveBugTests
         Assert.True(SpinWait.SpinUntil(() => Head(client).SequenceEqual(expected), ImplicitHarness.Timeout),
             $"T_O_IOData never became {Convert.ToHexString(expected)}, is {Convert.ToHexString(Head(client))}");
 
-    /// <summary>LastReceivedImplicitMessage is stamped after the callback handled a packet, whatever it was.</summary>
-    private static void WaitUntilPacketHandled(EEIPClient client, DateTime before) =>
-        Assert.True(SpinWait.SpinUntil(() => client.LastReceivedImplicitMessage != before, ImplicitHarness.Timeout),
-            "the client never handled the packet");
-
+    /// <summary>
+    /// Sends a packet the client is expected to reject and gives it time to be handled. A rejected packet leaves no
+    /// trace to wait for (not even LastReceivedImplicitMessage, which only counts accepted packets), so this waits.
+    /// </summary>
     private static async Task SendAndWaitUntilHandled(ImplicitHarness harness, byte[] packet)
     {
-        var before = harness.Client.LastReceivedImplicitMessage;
         await harness.SendToOriginatorAsync(packet, TestContext.Current.CancellationToken);
-        WaitUntilPacketHandled(harness.Client, before);
+        await Task.Delay(300, TestContext.Current.CancellationToken);
     }
 
     // ---- an oversized or undersized datagram throws on a threadpool thread, which terminates the process ----
