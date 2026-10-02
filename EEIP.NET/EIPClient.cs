@@ -648,21 +648,26 @@ namespace Sres.Net.EEIP
                 return t_o_detectedLength;
         }
 
+        /// <param name="deviceIPAddress">Unicast address of the device in host order (192.168.1.10 = 0xC0A8010A)</param>
+        /// <exception cref="ArgumentException">Class D (multicast) and class E (reserved) addresses are not device addresses</exception>
         internal static UInt32 GetMulticastAddress(UInt32 deviceIPAddress)
         {
             UInt32 cip_Mcast_Base_Addr = 0xEFC00100;
             UInt32 cip_Host_Mask = 0x3FF;
-            UInt32 netmask = 0;
+            UInt32 netmask;
 
             //Class A Network?
             if (deviceIPAddress <= 0x7FFFFFFF)
                 netmask = 0xFF000000;
             //Class B Network?
-            if (deviceIPAddress >= 0x80000000 && deviceIPAddress <= 0xBFFFFFFF)
+            else if (deviceIPAddress <= 0xBFFFFFFF)
                 netmask = 0xFFFF0000;
             //Class C Network?
-            if (deviceIPAddress >= 0xC0000000 && deviceIPAddress <= 0xDFFFFFFF)
+            else if (deviceIPAddress <= 0xDFFFFFFF)
                 netmask = 0xFFFFFF00;
+            //Class D (multicast) or class E (reserved): no host id to derive the group from
+            else
+                throw new ArgumentException("Not a unicast device address: " + Encapsulation.CIPIdentityItem.getIPAddress(deviceIPAddress), nameof(deviceIPAddress));
 
             UInt32 hostID = deviceIPAddress & ~netmask;
             UInt32 mcastIndex = hostID - 1;
@@ -1319,24 +1324,24 @@ namespace Sres.Net.EEIP
         internal static byte[] GetEPath(int classID, int instanceID, int attributeID)
         {
             int byteCount = 0;
-            if (classID < 0xff)
+            if (classID <= 0xff)
                 byteCount = byteCount + 2;
             else
                 byteCount = byteCount + 4;
            
-            if (instanceID < 0xff)
+            if (instanceID <= 0xff)
                 byteCount = byteCount + 2;
             else
                 byteCount = byteCount + 4;
             if (attributeID != 0)
-                if (attributeID < 0xff)
+                if (attributeID <= 0xff)
                     byteCount = byteCount + 2;
                 else
                     byteCount = byteCount + 4;
 
             byte[] returnValue = new byte[byteCount];
             byteCount = 0;
-            if (classID < 0xff)
+            if (classID <= 0xff)
             {
                 returnValue[byteCount] = 0x20;
                 returnValue[byteCount+1] = (byte)classID;
@@ -1352,7 +1357,7 @@ namespace Sres.Net.EEIP
             }
 
 
-            if (instanceID < 0xff)
+            if (instanceID <= 0xff)
             {
                 returnValue[byteCount] = 0x24;
                 returnValue[byteCount + 1] = (byte)instanceID;
@@ -1367,7 +1372,7 @@ namespace Sres.Net.EEIP
                 byteCount = byteCount + 4;
             }
             if (attributeID != 0)
-                if (attributeID < 0xff)
+                if (attributeID <= 0xff)
                 {
                     returnValue[byteCount] = 0x30;
                     returnValue[byteCount + 1] = (byte)attributeID;
