@@ -1,5 +1,7 @@
 ﻿using System;
+using System.Buffers.Binary;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.Linq;
 using System.Net.NetworkInformation;
 using System.Net.Sockets;
@@ -143,31 +145,6 @@ namespace Sres.Net.EEIP
             Console.WriteLine();
         }
 
-        private void ReceiveCallback(IAsyncResult ar)
-        {
-            lock (this)
-            {
-                UdpClient u = (UdpClient)((UdpState)(ar.AsyncState)).u;
-                
-                System.Net.IPEndPoint e = (System.Net.IPEndPoint)((UdpState)(ar.AsyncState)).e;
-
-                Byte[] receiveBytes = u.EndReceive(ar, ref e);
-                string receiveString = Encoding.ASCII.GetString(receiveBytes);
-
-                // EndReceive worked and we have received data and remote endpoint
-                if (receiveBytes.Length > 0)
-                {
-                    UInt16 command = Convert.ToUInt16(receiveBytes[0]
-                                                | (receiveBytes[1] << 8));
-                    if (command == 0x63)
-                    {
-                        returnList.Add(Encapsulation.CIPIdentityItem.getCIPIdentityItem(24, receiveBytes));
-                    }
-                }
-                var asyncResult = u.BeginReceive(new AsyncCallback(ReceiveCallback), (UdpState)(ar.AsyncState));
-            }
-
-        }
         public class UdpState
         {
             public System.Net.IPEndPoint e;
@@ -175,47 +152,103 @@ namespace Sres.Net.EEIP
 
         }
 
-        List<Encapsulation.CIPIdentityItem> returnList = new List<Encapsulation.CIPIdentityItem>();
-
         /// <summary>
         /// List and identify potential targets. This command shall be sent as braodcast massage using UDP.
+        /// The broadcast is sent on every interface address at once and the replies are collected for one second.
         /// </summary>
         /// <returns>List<Encapsulation.CIPIdentityItem> contains the received informations from all devices </returns>	
         public List<Encapsulation.CIPIdentityItem> ListIdentity()
         {
-            
-            foreach (NetworkInterface ni in NetworkInterface.GetAllNetworkInterfaces())
+            //A new list for every call: the replies of this call, and nothing that arrives after it returned
+            List<Encapsulation.CIPIdentityItem> returnList = new List<Encapsulation.CIPIdentityItem>();
+            List<UdpClient> sockets = new List<UdpClient>();
+            List<System.Threading.Tasks.Task> receivers = new List<System.Threading.Tasks.Task>();
+            try
             {
-                if ((ni.NetworkInterfaceType == NetworkInterfaceType.Wireless80211 || ni.NetworkInterfaceType == NetworkInterfaceType.Ethernet) && ni.OperationalStatus == OperationalStatus.Up)
+                foreach (NetworkInterface ni in NetworkInterface.GetAllNetworkInterfaces())
                 {
-
-                    foreach (UnicastIPAddressInformation ip in ni.GetIPProperties().UnicastAddresses)
+                    if ((ni.NetworkInterfaceType == NetworkInterfaceType.Wireless80211 || ni.NetworkInterfaceType == NetworkInterfaceType.Ethernet) && ni.OperationalStatus == OperationalStatus.Up)
                     {
-                        if (ip.Address.AddressFamily == System.Net.Sockets.AddressFamily.InterNetwork)
+
+                        foreach (UnicastIPAddressInformation ip in ni.GetIPProperties().UnicastAddresses)
                         {
-                            System.Net.IPAddress mask = ip.IPv4Mask;
-                            System.Net.IPAddress address = ip.Address;
+                            if (ip.Address.AddressFamily == System.Net.Sockets.AddressFamily.InterNetwork)
+                            {
+                                System.Net.IPAddress mask = ip.IPv4Mask;
+                                System.Net.IPAddress address = ip.Address;
 
-                            String multicastAddress = (address.GetAddressBytes()[0] | (~(mask.GetAddressBytes()[0])) & 0xFF).ToString() + "." + (address.GetAddressBytes()[1] | (~(mask.GetAddressBytes()[1])) & 0xFF).ToString() + "." + (address.GetAddressBytes()[2] | (~(mask.GetAddressBytes()[2])) & 0xFF).ToString() + "." + (address.GetAddressBytes()[3] | (~(mask.GetAddressBytes()[3])) & 0xFF).ToString();
+                                String multicastAddress = (address.GetAddressBytes()[0] | (~(mask.GetAddressBytes()[0])) & 0xFF).ToString() + "." + (address.GetAddressBytes()[1] | (~(mask.GetAddressBytes()[1])) & 0xFF).ToString() + "." + (address.GetAddressBytes()[2] | (~(mask.GetAddressBytes()[2])) & 0xFF).ToString() + "." + (address.GetAddressBytes()[3] | (~(mask.GetAddressBytes()[3])) & 0xFF).ToString();
 
-                            byte[] sendData = new byte[24];
-                            sendData[0] = 0x63;               //Command for "ListIdentity"
-                            System.Net.Sockets.UdpClient udpClient = new System.Net.Sockets.UdpClient();
-                            System.Net.IPEndPoint endPoint = new System.Net.IPEndPoint(System.Net.IPAddress.Parse(multicastAddress), 44818);
-                            udpClient.Send(sendData, sendData.Length, endPoint);
+                                byte[] sendData = new byte[24];
+                                sendData[0] = 0x63;               //Command for "ListIdentity"
+                                System.Net.Sockets.UdpClient udpClient = new System.Net.Sockets.UdpClient();
+                                sockets.Add(udpClient);
+                                udpClient.EnableBroadcast = true;       //The directed broadcast address is refused without it (Linux)
+                                System.Net.IPEndPoint endPoint = new System.Net.IPEndPoint(System.Net.IPAddress.Parse(multicastAddress), 44818);
+                                try
+                                {
+                                    udpClient.Send(sendData, sendData.Length, endPoint);
+                                }
+                                catch (SocketException)
+                                {
+                                    continue;       //This interface can't broadcast (e.g. network unreachable), the others still can
+                                }
 
-                            UdpState s = new UdpState();
-                            s.e = endPoint;
-                            s.u = udpClient;
-
-                            var asyncResult = udpClient.BeginReceive(new AsyncCallback(ReceiveCallback), s);
-
-                            System.Threading.Thread.Sleep(1000);
+                                receivers.Add(ReceiveIdentityReplies(udpClient, returnList));
+                            }
                         }
                     }
                 }
+                System.Threading.Thread.Sleep(1000);
+            }
+            finally
+            {
+                //Closing the sockets ends the receivers; once they are done nobody touches the list any more
+                foreach (UdpClient udpClient in sockets)
+                    udpClient.Close();
+                System.Threading.Tasks.Task.WaitAll(receivers.ToArray());
             }
             return returnList;
+        }
+
+        private static async System.Threading.Tasks.Task ReceiveIdentityReplies(UdpClient socket, List<Encapsulation.CIPIdentityItem> returnList)
+        {
+            while (true)
+            {
+                byte[] receiveBytes;
+                try
+                {
+                    receiveBytes = (await socket.ReceiveAsync().ConfigureAwait(false)).Buffer;
+                }
+                catch (ObjectDisposedException)
+                {
+                    return;                     //Closed at the end of ListIdentity
+                }
+                catch (SocketException e) when (e.SocketErrorCode == SocketError.ConnectionReset)
+                {
+                    continue;                   //ICMP "port unreachable" (Windows), not the end of the socket
+                }
+                catch (SocketException)
+                {
+                    return;                     //Closed at the end of ListIdentity (operation aborted) or unusable
+                }
+
+                if (receiveBytes.Length < 2 || (receiveBytes[0] | (receiveBytes[1] << 8)) != 0x63)
+                    continue;
+                Encapsulation.CIPIdentityItem item;
+                try
+                {
+                    item = Encapsulation.CIPIdentityItem.getCIPIdentityItem(24, receiveBytes);
+                }
+                catch (System.IO.InvalidDataException)
+                {
+                    continue;                   //Not a (complete) reply of an EtherNet/IP device, ignore it
+                }
+                lock (returnList)
+                {
+                    returnList.Add(item);
+                }
+            }
         }
 
         /// <summary>
@@ -242,14 +275,18 @@ namespace Sres.Net.EEIP
             client = new TcpClient(ipAddress, port);
             stream = client.GetStream();
 
-            stream.Write(encapsulation.toBytes(), 0, encapsulation.toBytes().Length);
-            byte[] data = new Byte[256];
-
-            Int32 bytes = stream.Read(data, 0, data.Length);
-
-            UInt32 returnvalue = (UInt32)data[4] + (((UInt32)data[5]) << 8) + (((UInt32)data[6]) << 16) + (((UInt32)data[7]) << 24);
-            this.sessionHandle = returnvalue;
-            return returnvalue;
+            try
+            {
+                stream.Write(encapsulation.toBytes(), 0, encapsulation.toBytes().Length);
+                byte[] data = ReadEncapsulationFrame();
+                this.sessionHandle = BinaryPrimitives.ReadUInt32LittleEndian(data.AsSpan(4));
+            }
+            catch
+            {
+                client.Close();
+                throw;
+            }
+            return this.sessionHandle;
         }
 
         /// <summary>
@@ -282,10 +319,9 @@ namespace Sres.Net.EEIP
         }
 
         System.Net.Sockets.UdpClient udpClientReceive;
-        bool udpClientReceiveClosed = false;
+        System.Threading.CancellationTokenSource sendCancellation;
         public void ForwardOpen(bool largeForwardOpen)
         {
-            udpClientReceiveClosed = false;
             ushort o_t_headerOffset = 2;                    //Zählt den Sequencecount und evtl 32bit header zu der Länge dazu
             if (O_T_RealTimeFormat == RealTimeFormat.Header32Bit)
                 o_t_headerOffset = 6;
@@ -486,7 +522,7 @@ namespace Sres.Net.EEIP
                 commonPacketFormat.SocketaddrInfo_O_T.SIN_family = 2;
             if (O_T_ConnectionType == ConnectionType.Multicast)
             {
-                UInt32 multicastResponseAddress = EEIPClient.GetMulticastAddress(BitConverter.ToUInt32(System.Net.IPAddress.Parse(IPAddress).GetAddressBytes(), 0));
+                UInt32 multicastResponseAddress = EEIPClient.GetMulticastAddress(BinaryPrimitives.ReadUInt32BigEndian(System.Net.IPAddress.Parse(IPAddress).GetAddressBytes()));
 
                 commonPacketFormat.SocketaddrInfo_O_T.SIN_Address = (multicastResponseAddress);
 
@@ -504,15 +540,13 @@ namespace Sres.Net.EEIP
             //encapsulation.toBytes();
             
             stream.Write(dataToWrite, 0, dataToWrite.Length);
-            byte[] data = new Byte[564];
-
-            Int32 bytes = stream.Read(data, 0, data.Length);
+            byte[] data = ReadSendRRDataReply();
 
             //--------------------------BEGIN Error?
             if (data[42] != 0)      //Exception codes see "Table B-1.1 CIP General Status Codes"
             {
                 if (data[42] == 0x1)
-                    if (data[43] == 0)
+                    if (data[43] == 0 || data.Length < 46)
                         throw new CIPException("Connection failure, General Status Code: " + data[42]);
                     else
                         throw new CIPException("Connection failure, General Status Code: " + data[42] + " Additional Status Code: " + ((data[45] << 8) | data[44]) + " " + ObjectLibrary.ConnectionManagerObject.GetExtendedStatus((uint)((data[45] << 8) | data[44])));
@@ -520,6 +554,8 @@ namespace Sres.Net.EEIP
                     throw new CIPException(GeneralStatusCodes.GetStatusCode(data[42]));
             }
             //--------------------------END Error?
+            if (data.Length < 52)
+                throw new CIPException("Truncated Forward_Open reply: " + data.Length + " bytes");
             //Read the Network ID from the Reply (see 3-3.7.1.1)
             int itemCount = data[30] + (data[31] << 8);
             int lengthUnconectedDataItem = data[38] + (data[39] << 8);
@@ -529,13 +565,13 @@ namespace Sres.Net.EEIP
             //Is a SocketInfoItem present?
             int numberOfCurrentItem = 0;
             Encapsulation.SocketAddress socketInfoItem;
-            while (itemCount > 2)
+            while (itemCount > 2 && 40 + lengthUnconectedDataItem + 20 * (numberOfCurrentItem + 1) <= data.Length)
             {
                 int typeID = data[40 + lengthUnconectedDataItem+ 20 * numberOfCurrentItem] + (data[40 + lengthUnconectedDataItem + 1+ 20 * numberOfCurrentItem] << 8);
                 if (typeID == 0x8001)
                 {
                     socketInfoItem = new Encapsulation.SocketAddress();
-                    socketInfoItem.SIN_Address = (UInt32)(data[40 + lengthUnconectedDataItem + 8 + 20 * numberOfCurrentItem]) + (UInt32)(data[40 + lengthUnconectedDataItem + 9 + 20 * numberOfCurrentItem] << 8) + (UInt32)(data[40 + lengthUnconectedDataItem + 10 + 20 * numberOfCurrentItem] << 16) + (UInt32)(data[40 + lengthUnconectedDataItem + 11 + 20 * numberOfCurrentItem] << 24);
+                    socketInfoItem.SIN_Address = BinaryPrimitives.ReadUInt32BigEndian(data.AsSpan(40 + lengthUnconectedDataItem + 8 + 20 * numberOfCurrentItem));
                     socketInfoItem.SIN_port = (UInt16)((UInt16)(data[40 + lengthUnconectedDataItem + 7 + 20 * numberOfCurrentItem]) + (UInt16)(data[40 + lengthUnconectedDataItem + 6 + 20 * numberOfCurrentItem] << 8));
                     if (T_O_ConnectionType == ConnectionType.Multicast)
                         multicastAddress = socketInfoItem.SIN_Address;
@@ -550,20 +586,23 @@ namespace Sres.Net.EEIP
 
             System.Net.IPEndPoint endPointReceive = new System.Net.IPEndPoint(System.Net.IPAddress.Any, OriginatorUDPPort);
             udpClientReceive = new System.Net.Sockets.UdpClient(endPointReceive);
-            UdpState s = new UdpState();
-            s.e = endPointReceive;
-            s.u = udpClientReceive;
             if (multicastAddress != 0)
             {
-                System.Net.IPAddress multicast = (new System.Net.IPAddress(multicastAddress));
+                byte[] multicastBytes = new byte[4];
+                BinaryPrimitives.WriteUInt32BigEndian(multicastBytes, multicastAddress);
+                System.Net.IPAddress multicast = new System.Net.IPAddress(multicastBytes);
                 udpClientReceive.JoinMulticastGroup(multicast);
               
             }
 
-            System.Threading.Thread sendThread = new System.Threading.Thread(sendUDP);
+            //Every connection gets its own token and receive loop: a late ForwardClose or a late completion of the previous connection's socket can't touch this one
+            sendCancellation = new System.Threading.CancellationTokenSource();
+            System.Threading.CancellationToken stopSending = sendCancellation.Token;
+            System.Threading.Thread sendThread = new System.Threading.Thread(() => sendUDP(stopSending));
+            sendThread.IsBackground = true;
             sendThread.Start();
 
-            var asyncResult = udpClientReceive.BeginReceive(new AsyncCallback(ReceiveCallbackClass1), s);
+            _ = ReceiveLoopClass1(udpClientReceive);
         }
 
         public void LargeForwardOpen()
@@ -609,21 +648,26 @@ namespace Sres.Net.EEIP
                 return t_o_detectedLength;
         }
 
+        /// <param name="deviceIPAddress">Unicast address of the device in host order (192.168.1.10 = 0xC0A8010A)</param>
+        /// <exception cref="ArgumentException">Class D (multicast) and class E (reserved) addresses are not device addresses</exception>
         internal static UInt32 GetMulticastAddress(UInt32 deviceIPAddress)
         {
             UInt32 cip_Mcast_Base_Addr = 0xEFC00100;
             UInt32 cip_Host_Mask = 0x3FF;
-            UInt32 netmask = 0;
+            UInt32 netmask;
 
             //Class A Network?
             if (deviceIPAddress <= 0x7FFFFFFF)
                 netmask = 0xFF000000;
             //Class B Network?
-            if (deviceIPAddress >= 0x80000000 && deviceIPAddress <= 0xBFFFFFFF)
+            else if (deviceIPAddress <= 0xBFFFFFFF)
                 netmask = 0xFFFF0000;
             //Class C Network?
-            if (deviceIPAddress >= 0xC0000000 && deviceIPAddress <= 0xDFFFFFFF)
+            else if (deviceIPAddress <= 0xDFFFFFFF)
                 netmask = 0xFFFFFF00;
+            //Class D (multicast) or class E (reserved): no host id to derive the group from
+            else
+                throw new ArgumentException("Not a unicast device address: " + Encapsulation.CIPIdentityItem.getIPAddress(deviceIPAddress), nameof(deviceIPAddress));
 
             UInt32 hostID = deviceIPAddress & ~netmask;
             UInt32 mcastIndex = hostID - 1;
@@ -637,7 +681,7 @@ namespace Sres.Net.EEIP
         {
             //First stop the Thread which send data
 
-            stopUDP = true;
+            sendCancellation?.Cancel();
 
 
             int lengthOffset = (5 + (O_T_ConnectionType == ConnectionType.Null ? 0 : 2) + (T_O_ConnectionType == ConnectionType.Null ? 0 : 2));
@@ -749,27 +793,26 @@ namespace Sres.Net.EEIP
             {
                 //Handle Exception  to allow Forward close if the connection was closed by the Remote Device before
             }
-            byte[] data = new Byte[564];
+            byte[] data = null;
 
             try
             {
-                Int32 bytes = stream.Read(data, 0, data.Length);
+                data = ReadSendRRDataReply();
             }
-            catch (Exception e)
+            catch (Exception e) when (e is not CIPException)
             {
                 //Handle Exception  to allow Forward close if the connection was closed by the Remote Device before
             }
 
 
             //--------------------------BEGIN Error?
-            if (data[42] != 0)      //Exception codes see "Table B-1.1 CIP General Status Codes"
+            if (data != null && data[42] != 0)      //Exception codes see "Table B-1.1 CIP General Status Codes"
             {
                 throw new CIPException(GeneralStatusCodes.GetStatusCode(data[42]));
             }
 
 
             //Close the Socket for Receive
-            udpClientReceiveClosed = true;
             udpClientReceive.Close();
   
            
@@ -777,143 +820,172 @@ namespace Sres.Net.EEIP
 
         }
 
-        private bool stopUDP;
-        int sequence = 0;
-        private void sendUDP()
+        private void sendUDP(System.Threading.CancellationToken stop)
         {
-            System.Net.Sockets.UdpClient udpClientsend = new System.Net.Sockets.UdpClient();
-            stopUDP = false;
+            System.Net.IPEndPoint endPointsend = new System.Net.IPEndPoint(System.Net.IPAddress.Parse(IPAddress), TargetUDPPort);
+            System.Net.SocketAddress targetAddress = endPointsend.Serialize();     //Serialized once, so that sending does not allocate
+            using System.Net.Sockets.Socket udpSend = new System.Net.Sockets.Socket(endPointsend.AddressFamily, System.Net.Sockets.SocketType.Dgram, System.Net.Sockets.ProtocolType.Udp);
+
+            ushort headerOffset = 0;
+            if (O_T_RealTimeFormat == RealTimeFormat.Header32Bit)
+                headerOffset = 4;
+            int dataLength = O_T_Length;
+            ushort o_t_Length = (ushort)(dataLength + headerOffset + 2);   //Modeless and zero Length
+            byte[] o_t_IOData = new byte[20 + headerOffset + dataLength];
+
+            //The packet is built once, only the sequence counts and the data change from packet to packet
+            //---------------Item count
+            o_t_IOData[0] = 2;
+            o_t_IOData[1] = 0;
+            //---------------Type ID
+            o_t_IOData[2] = 0x02;
+            o_t_IOData[3] = 0x80;
+            //---------------Length
+            o_t_IOData[4] = 0x08;
+            o_t_IOData[5] = 0x00;
+            //---------------connection ID
+            o_t_IOData[6] = (byte)(connectionID_O_T);
+            o_t_IOData[7] = (byte)(connectionID_O_T >> 8);
+            o_t_IOData[8] = (byte)(connectionID_O_T >> 16);
+            o_t_IOData[9] = (byte)(connectionID_O_T >> 24);
+            //---------------Type ID
+            o_t_IOData[14] = 0xB1;
+            o_t_IOData[15] = 0x00;
+            //---------------Length
+            o_t_IOData[16] = (byte)o_t_Length;
+            o_t_IOData[17] = (byte)(o_t_Length >> 8);
+            //---------------32 bit Real Time Header (run)
+            if (O_T_RealTimeFormat == RealTimeFormat.Header32Bit)
+                o_t_IOData[20] = 1;
+
+            //The requested packet rate is in microseconds
+            long interval = (long)(RequestedPacketRate_O_T * (double)Stopwatch.Frequency / 1_000_000);
+            long nextSend = Stopwatch.GetTimestamp();
             uint sequenceCount = 0;
 
-
-            while (!stopUDP)
+            while (!stop.IsCancellationRequested)
             {
-                byte[] o_t_IOData = new byte[564];
-                System.Net.IPEndPoint endPointsend = new System.Net.IPEndPoint(System.Net.IPAddress.Parse(IPAddress), TargetUDPPort);
-               
-                UdpState send = new UdpState();
-                 
-                //---------------Item count
-                o_t_IOData[0] = 2;
-                o_t_IOData[1] = 0;
-                //---------------Item count
-
-                //---------------Type ID
-                o_t_IOData[2] = 0x02;
-                o_t_IOData[3] = 0x80;
-                //---------------Type ID
-
-                //---------------Length
-                o_t_IOData[4] = 0x08;
-                o_t_IOData[5] = 0x00;
-                //---------------Length
-
-                //---------------connection ID
                 sequenceCount++;
-                o_t_IOData[6] = (byte)(connectionID_O_T);
-                o_t_IOData[7] = (byte)(connectionID_O_T >> 8); 
-                o_t_IOData[8] = (byte)(connectionID_O_T >> 16); 
-                o_t_IOData[9] = (byte)(connectionID_O_T >> 24);
-                //---------------connection ID     
-
                 //---------------sequence count
                 o_t_IOData[10] = (byte)(sequenceCount);
                 o_t_IOData[11] = (byte)(sequenceCount >> 8);
                 o_t_IOData[12] = (byte)(sequenceCount >> 16);
                 o_t_IOData[13] = (byte)(sequenceCount >> 24);
-                //---------------sequence count            
-
-                //---------------Type ID
-                o_t_IOData[14] = 0xB1;
-                o_t_IOData[15] = 0x00;
-                //---------------Type ID
-
-                ushort headerOffset = 0;
-                if (O_T_RealTimeFormat == RealTimeFormat.Header32Bit)
-                    headerOffset = 4;
-                if (O_T_RealTimeFormat == RealTimeFormat.Heartbeat)
-                    headerOffset = 0;
-                ushort o_t_Length = (ushort)(O_T_Length + headerOffset+2);   //Modeless and zero Length
-
-                //---------------Length
-                o_t_IOData[16] = (byte)o_t_Length;
-                o_t_IOData[17] = (byte)(o_t_Length >> 8);
-                //---------------Length
-
                 //---------------Sequence count
-                sequence++;
                 if (O_T_RealTimeFormat != RealTimeFormat.Heartbeat)
                 {
-                    o_t_IOData[18] = (byte)sequence;
-                    o_t_IOData[19] = (byte)(sequence >> 8);
-                }
-                //---------------Sequence count
-
-                if (O_T_RealTimeFormat == RealTimeFormat.Header32Bit)
-                {
-                    o_t_IOData[20] = (byte)1;
-                    o_t_IOData[21] = (byte)0;
-                    o_t_IOData[22] = (byte)0;
-                    o_t_IOData[23] = (byte)0;
-
+                    o_t_IOData[18] = (byte)sequenceCount;
+                    o_t_IOData[19] = (byte)(sequenceCount >> 8);
                 }
 
                 //---------------Write data
                 lock (_O_T_IOData_lock)
                 {
-                    Array.Copy(_O_T_IOData, 0, o_t_IOData, 20 + headerOffset, O_T_Length);
+                    Array.Copy(_O_T_IOData, 0, o_t_IOData, 20 + headerOffset, dataLength);
                 }
                 //---------------Write data
 
+                udpSend.SendTo(o_t_IOData, System.Net.Sockets.SocketFlags.None, targetAddress);
 
-
-
-                udpClientsend.Send(o_t_IOData, O_T_Length+20+headerOffset, endPointsend);
-                System.Threading.Thread.Sleep((int)RequestedPacketRate_O_T/1000);
-
+                //Absolute deadlines, so that the time spent building and sending a packet (and sleeping too long) does not add up to the interval
+                nextSend += interval;
+                long now = Stopwatch.GetTimestamp();
+                if (nextSend < now - interval)      //More than one packet behind: carry on from now instead of sending a burst
+                    nextSend = now;
+                if (!WaitUntil(nextSend, stop))
+                    break;
             }
-
-            udpClientsend.Close();
-
         }
 
-        private void ReceiveCallbackClass1(IAsyncResult ar)
-        {          
-            UdpClient u = (UdpClient)((UdpState)(ar.AsyncState)).u;
-            if (udpClientReceiveClosed)
+        /// <summary>
+        /// Waits until <paramref name="deadline"/> (a <see cref="Stopwatch"/> timestamp) or until <paramref name="stop"/> is cancelled.
+        /// Sleeping is only accurate to about a millisecond, so the last bit is spun out, which is the only way to
+        /// keep an interval below a few milliseconds. Long intervals just sleep: a little jitter is better than a busy core.
+        /// </summary>
+        /// <returns>false if cancelled</returns>
+        private static bool WaitUntil(long deadline, System.Threading.CancellationToken stop)
+        {
+            long remainingMilliseconds = (deadline - Stopwatch.GetTimestamp()) * 1000 / Stopwatch.Frequency;
+            long sleepMilliseconds = remainingMilliseconds >= 5 ? remainingMilliseconds : remainingMilliseconds - 1;
+            if (sleepMilliseconds > 0 && stop.WaitHandle.WaitOne((int)sleepMilliseconds))
+                return false;
+
+            System.Threading.SpinWait spinner = new System.Threading.SpinWait();
+            while (Stopwatch.GetTimestamp() < deadline)
+            {
+                if (stop.IsCancellationRequested)
+                    return false;
+                spinner.SpinOnce(-1);       //Never sleeps, only spins and yields
+            }
+            return !stop.IsCancellationRequested;
+        }
+
+        /// <summary>
+        /// Receives the class 1 T->O packets of one connection until its socket is closed (ForwardClose).
+        /// Packets are handled one at a time and in order; nothing a packet contains can end the loop.
+        /// </summary>
+        private async System.Threading.Tasks.Task ReceiveLoopClass1(UdpClient socket)
+        {
+            bool sequenceKnown = false;
+            ushort lastSequence = 0;
+            while (true)
+            {
+                byte[] receiveBytes;
+                try
+                {
+                    receiveBytes = (await socket.ReceiveAsync().ConfigureAwait(false)).Buffer;
+                }
+                catch (ObjectDisposedException)
+                {
+                    return;                     //Closed by ForwardClose
+                }
+                catch (SocketException e) when (e.SocketErrorCode == SocketError.ConnectionReset)
+                {
+                    continue;                   //ICMP "port unreachable" for an earlier send (Windows), not the end of the socket
+                }
+                catch (SocketException)
+                {
+                    return;                     //Closed by ForwardClose (operation aborted) or unusable
+                }
+                HandleClass1Packet(receiveBytes, ref sequenceKnown, ref lastSequence);
+                LastReceivedImplicitMessage = DateTime.Now;
+            }
+        }
+
+        private void HandleClass1Packet(byte[] receiveBytes, ref bool sequenceKnown, ref ushort lastSequence)
+        {
+            ushort headerOffset = 0;
+            if (T_O_RealTimeFormat == RealTimeFormat.Header32Bit)
+                headerOffset = 4;
+
+            //20 bytes: item count, sequenced address item (with connection ID and sequence number), connected data item header and its sequence count
+            if (receiveBytes.Length < 20 + headerOffset)
                 return;
 
-            u.BeginReceive(new AsyncCallback(ReceiveCallbackClass1), (UdpState)(ar.AsyncState));
-            System.Net.IPEndPoint e = (System.Net.IPEndPoint)((UdpState)(ar.AsyncState)).e;
+            //Get the connection ID
+            uint connectionID = (uint)(receiveBytes[6] | receiveBytes[7] << 8 | receiveBytes[8] << 16 | receiveBytes[9] << 24);
+            if (connectionID != connectionID_T_O)
+                return;
 
+            //The data must be in a connected data item (0x00B1)
+            if ((receiveBytes[14] | receiveBytes[15] << 8) != 0xB1)
+                return;
 
-            Byte[] receiveBytes = u.EndReceive(ar, ref e);
+            int dataLength = receiveBytes.Length - 20 - headerOffset;
+            if (dataLength > _T_O_IOData.Length)
+                return;
 
-            // EndReceive worked and we have received data and remote endpoint
+            //Ignore duplicates and old packets: only a count that is "ahead" of the last one (modulo 2^16) is new
+            ushort sequence = (ushort)(receiveBytes[18] | receiveBytes[19] << 8);
+            if (sequenceKnown && (short)(sequence - lastSequence) <= 0)
+                return;
+            sequenceKnown = true;
+            lastSequence = sequence;
 
-            if (receiveBytes.Length > 20)
+            lock (_T_O_IOData_lock)
             {
-                //Get the connection ID
-                uint connectionID = (uint)(receiveBytes[6] | receiveBytes[7] << 8 | receiveBytes[8] << 16 | receiveBytes[9] << 24);
-
-
-                if (connectionID == connectionID_T_O)
-                {
-                    ushort headerOffset = 0;
-                    if (T_O_RealTimeFormat == RealTimeFormat.Header32Bit)
-                        headerOffset = 4;
-                    if (T_O_RealTimeFormat == RealTimeFormat.Heartbeat)
-                        headerOffset = 0;
-
-                    lock (_T_O_IOData_lock)
-                    {
-                        Array.Copy(receiveBytes, 20 + headerOffset, _T_O_IOData, 0,
-                            receiveBytes.Length - 20 - headerOffset);
-                    }
-                    //Console.WriteLine(T_O_IOData[0]);
-                }
+                Array.Copy(receiveBytes, 20 + headerOffset, _T_O_IOData, 0, dataLength);
             }
-            LastReceivedImplicitMessage = DateTime.Now;
         }
 
 
@@ -1015,9 +1087,7 @@ namespace Sres.Net.EEIP
             encapsulation.toBytes();
 
             stream.Write(dataToWrite, 0, dataToWrite.Length);
-            byte[] data = new Byte[564];
-
-            Int32 bytes = stream.Read(data, 0, data.Length);
+            byte[] data = ReadSendRRDataReply();
 
             //--------------------------BEGIN Error?
             if (data[42] != 0)      //Exception codes see "Table B-1.1 CIP General Status Codes"
@@ -1026,8 +1096,7 @@ namespace Sres.Net.EEIP
             }
             //--------------------------END Error?
 
-            byte[] returnData = new byte[bytes - 44];
-            System.Buffer.BlockCopy(data, 44, returnData, 0, bytes-44);
+            byte[] returnData = data.AsSpan(44, 40 + (data[38] | data[39] << 8) - 44).ToArray();
 
             return returnData;
         }
@@ -1096,9 +1165,7 @@ namespace Sres.Net.EEIP
            
 
             stream.Write(dataToWrite, 0, dataToWrite.Length);
-            byte[] data = new Byte[564];
-
-            Int32 bytes = stream.Read(data, 0, data.Length);
+            byte[] data = ReadSendRRDataReply();
             //--------------------------BEGIN Error?
             if (data[42] != 0)      //Exception codes see "Table B-1.1 CIP General Status Codes"
             {
@@ -1106,8 +1173,7 @@ namespace Sres.Net.EEIP
             }
             //--------------------------END Error?
 
-            byte[] returnData = new byte[bytes - 44];
-            System.Buffer.BlockCopy(data, 44, returnData, 0, bytes - 44);
+            byte[] returnData = data.AsSpan(44, 40 + (data[38] | data[39] << 8) - 44).ToArray();
 
             return returnData;
         }
@@ -1180,9 +1246,7 @@ namespace Sres.Net.EEIP
             encapsulation.toBytes();
 
             stream.Write(dataToWrite, 0, dataToWrite.Length);
-            byte[] data = new Byte[564];
-
-            Int32 bytes = stream.Read(data, 0, data.Length);
+            byte[] data = ReadSendRRDataReply();
 
             //--------------------------BEGIN Error?
             if (data[42] != 0)      //Exception codes see "Table B-1.1 CIP General Status Codes"
@@ -1191,10 +1255,61 @@ namespace Sres.Net.EEIP
             }
             //--------------------------END Error?
 
-            byte[] returnData = new byte[bytes - 44];
-            System.Buffer.BlockCopy(data, 44, returnData, 0, bytes - 44);
+            byte[] returnData = data.AsSpan(44, 40 + (data[38] | data[39] << 8) - 44).ToArray();
 
             return returnData;
+        }
+
+        /// <summary>
+        /// Reads one complete encapsulation message: the 24 byte header and, as announced by its length field, the
+        /// body. TCP is a byte stream, so a message may arrive in several pieces and be of any size up to 65559 bytes.
+        /// </summary>
+        /// <returns>Header and body</returns>
+        /// <exception cref="CIPException">The encapsulation status of the reply is not "success"</exception>
+        /// <exception cref="System.IO.IOException">The connection ended before the whole message arrived</exception>
+        private byte[] ReadEncapsulationFrame()
+        {
+            byte[] frame = new byte[24];
+            stream.ReadExactly(frame, 0, 24);
+            int length = BinaryPrimitives.ReadUInt16LittleEndian(frame.AsSpan(2));
+            if (length > 0)
+            {
+                Array.Resize(ref frame, 24 + length);
+                stream.ReadExactly(frame, 24, length);      //Also consumed on an error status, to keep the stream in sync
+            }
+            uint status = BinaryPrimitives.ReadUInt32LittleEndian(frame.AsSpan(8));
+            if (status != 0)
+                throw new CIPException("Encapsulation error, Status Code: 0x" + status.ToString("X2") + " (" + GetEncapsulationStatusText(status) + ")");
+            return frame;
+        }
+
+        /// <summary>
+        /// Reads the reply to a SendRRData command and makes sure that the CIP reply header (general status at byte
+        /// 42, additional status size at byte 43) is there and that the data item fits in the message.
+        /// </summary>
+        private byte[] ReadSendRRDataReply()
+        {
+            byte[] frame = ReadEncapsulationFrame();
+            if (frame.Length < 44)
+                throw new CIPException("Truncated SendRRData reply: " + frame.Length + " bytes");
+            int dataItemEnd = 40 + (frame[38] | frame[39] << 8);
+            if (dataItemEnd < 44 || dataItemEnd > frame.Length)
+                throw new CIPException("Invalid data item length in SendRRData reply");
+            return frame;
+        }
+
+        private static string GetEncapsulationStatusText(uint status)
+        {
+            switch (status)
+            {
+                case 0x01: return "invalid or unsupported command";
+                case 0x02: return "insufficient memory";
+                case 0x03: return "incorrect data";
+                case 0x64: return "invalid session handle";
+                case 0x65: return "invalid length";
+                case 0x69: return "unsupported encapsulation protocol revision";
+                default: return "unknown";
+            }
         }
 
         /// <summary>
@@ -1209,24 +1324,24 @@ namespace Sres.Net.EEIP
         internal static byte[] GetEPath(int classID, int instanceID, int attributeID)
         {
             int byteCount = 0;
-            if (classID < 0xff)
+            if (classID <= 0xff)
                 byteCount = byteCount + 2;
             else
                 byteCount = byteCount + 4;
            
-            if (instanceID < 0xff)
+            if (instanceID <= 0xff)
                 byteCount = byteCount + 2;
             else
                 byteCount = byteCount + 4;
             if (attributeID != 0)
-                if (attributeID < 0xff)
+                if (attributeID <= 0xff)
                     byteCount = byteCount + 2;
                 else
                     byteCount = byteCount + 4;
 
             byte[] returnValue = new byte[byteCount];
             byteCount = 0;
-            if (classID < 0xff)
+            if (classID <= 0xff)
             {
                 returnValue[byteCount] = 0x20;
                 returnValue[byteCount+1] = (byte)classID;
@@ -1242,7 +1357,7 @@ namespace Sres.Net.EEIP
             }
 
 
-            if (instanceID < 0xff)
+            if (instanceID <= 0xff)
             {
                 returnValue[byteCount] = 0x24;
                 returnValue[byteCount + 1] = (byte)instanceID;
@@ -1257,7 +1372,7 @@ namespace Sres.Net.EEIP
                 byteCount = byteCount + 4;
             }
             if (attributeID != 0)
-                if (attributeID < 0xff)
+                if (attributeID <= 0xff)
                 {
                     returnValue[byteCount] = 0x30;
                     returnValue[byteCount + 1] = (byte)attributeID;

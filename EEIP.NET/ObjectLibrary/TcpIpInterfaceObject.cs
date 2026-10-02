@@ -56,7 +56,7 @@ namespace Sres.Net.EEIP.ObjectLibrary
                 if ((byteArray[0] & 0x04) != 0)
                     configurationCapability.DHCPClient = true;
                 if ((byteArray[0] & 0x08) != 0)
-                    configurationCapability.DHCPClient = true;
+                    configurationCapability.DHCP_DNSUpdate = true;
                 if ((byteArray[0] & 0x10) != 0)
                     configurationCapability.ConfigurationSettable = true;
                 return configurationCapability;
@@ -73,8 +73,10 @@ namespace Sres.Net.EEIP.ObjectLibrary
                 byte[] byteArray = eeipClient.GetAttributeSingle(0xF5, 1, 4);
                 PhysicalLink physicalLinkObject = new PhysicalLink();
                 physicalLinkObject.PathSize = (UInt16)(byteArray[1] << 8 | byteArray[0]);
-                if (byteArray.Length > 2)
-                    System.Buffer.BlockCopy(byteArray, 2 , physicalLinkObject.Path, 0, byteArray.Length - 2);
+                // The path size is counted in 16-bit words
+                int pathBytes = Math.Min(physicalLinkObject.PathSize * 2, byteArray.Length - 2);
+                physicalLinkObject.Path = new byte[pathBytes];
+                System.Buffer.BlockCopy(byteArray, 2, physicalLinkObject.Path, 0, pathBytes);
                 return physicalLinkObject;
             }
         }
