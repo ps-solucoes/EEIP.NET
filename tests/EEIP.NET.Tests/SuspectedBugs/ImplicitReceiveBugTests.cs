@@ -10,7 +10,6 @@ namespace EEIP.NET.Tests.SuspectedBugs;
 [Trait("Category", "SuspectedBug")]
 public sealed class ImplicitReceiveBugTests
 {
-    private static readonly byte[] Zeros = new byte[4];
     private static readonly byte[] First = [0xA1, 0xA2, 0xA3, 0xA4];
     private static readonly byte[] Second = [0xB1, 0xB2, 0xB3, 0xB4];
 
@@ -19,16 +18,6 @@ public sealed class ImplicitReceiveBugTests
     private static void WaitForData(EEIPClient client, byte[] expected) =>
         Assert.True(SpinWait.SpinUntil(() => Head(client).SequenceEqual(expected), ImplicitHarness.Timeout),
             $"T_O_IOData never became {Convert.ToHexString(expected)}, is {Convert.ToHexString(Head(client))}");
-
-    /// <summary>
-    /// Sends a packet the client is expected to reject and gives it time to be handled. A rejected packet leaves no
-    /// trace to wait for (not even LastReceivedImplicitMessage, which only counts accepted packets), so this waits.
-    /// </summary>
-    private static async Task SendAndWaitUntilHandled(ImplicitHarness harness, byte[] packet)
-    {
-        await harness.SendToOriginatorAsync(packet, TestContext.Current.CancellationToken);
-        await Task.Delay(300, TestContext.Current.CancellationToken);
-    }
 
     // ---- an oversized or undersized datagram throws on a threadpool thread, which terminates the process ----
 
@@ -122,9 +111,7 @@ public sealed class ImplicitReceiveBugTests
         harness.Client.ForwardOpen();
         try
         {
-            await SendAndWaitUntilHandled(harness, ImplicitHarness.BuildTOPacket(ImplicitHarness.ConnectionIdTO, First, dataItemType: dataItemType));
-
-            Assert.Equal(Zeros, Head(harness.Client));
+            await harness.SendAndAssertIgnoredAsync(ImplicitHarness.BuildTOPacket(ImplicitHarness.ConnectionIdTO, First, dataItemType: dataItemType), sentinelSequence: 2);
         }
         finally
         {
@@ -144,9 +131,7 @@ public sealed class ImplicitReceiveBugTests
             await harness.SendToOriginatorAsync(ImplicitHarness.BuildTOPacket(ImplicitHarness.ConnectionIdTO, First, sequence: 5), TestContext.Current.CancellationToken);
             WaitForData(harness.Client, First);
 
-            await SendAndWaitUntilHandled(harness, ImplicitHarness.BuildTOPacket(ImplicitHarness.ConnectionIdTO, Second, sequence: 5));
-
-            Assert.Equal(First, Head(harness.Client));
+            await harness.SendAndAssertIgnoredAsync(ImplicitHarness.BuildTOPacket(ImplicitHarness.ConnectionIdTO, Second, sequence: 5), sentinelSequence: 6);
         }
         finally
         {
@@ -164,9 +149,7 @@ public sealed class ImplicitReceiveBugTests
             await harness.SendToOriginatorAsync(ImplicitHarness.BuildTOPacket(ImplicitHarness.ConnectionIdTO, First, sequence: 5), TestContext.Current.CancellationToken);
             WaitForData(harness.Client, First);
 
-            await SendAndWaitUntilHandled(harness, ImplicitHarness.BuildTOPacket(ImplicitHarness.ConnectionIdTO, Second, sequence: 4));
-
-            Assert.Equal(First, Head(harness.Client));
+            await harness.SendAndAssertIgnoredAsync(ImplicitHarness.BuildTOPacket(ImplicitHarness.ConnectionIdTO, Second, sequence: 4), sentinelSequence: 6);
         }
         finally
         {

@@ -1,4 +1,5 @@
 using System.Buffers.Binary;
+using System.Diagnostics;
 using System.Net;
 using System.Net.Sockets;
 using Sres.Net.EEIP;
@@ -93,6 +94,32 @@ public sealed class ImplicitHarness : IDisposable
 
     public async Task SendToOriginatorAsync(byte[] packet, CancellationToken token = default) =>
         await TargetUdp.SendAsync(packet, OriginatorEndpoint, token);
+
+    /// <summary>
+    /// Sends a packet the client must ignore and checks for a while that neither the data nor LastReceivedImplicitMessage
+    /// changes. Then a valid sentinel packet (with <paramref name="sentinelSequence"/>) follows: packets are handled in order,
+    /// so once the sentinel's data shows up the ignored packet has been handled too, and the receive loop is still alive.
+    /// Without the sentinel a dead receive loop would pass for one that ignores the packet.
+    /// </summary>
+    public async Task SendAndAssertIgnoredAsync(byte[] packet, uint sentinelSequence)
+    {
+        var token = TestContext.Current.CancellationToken;
+        byte[] data = Client.T_O_IOData[..4];
+        var stamp = Client.LastReceivedImplicitMessage;
+        await SendToOriginatorAsync(packet, token);
+        var window = Stopwatch.StartNew();
+        while (window.Elapsed < TimeSpan.FromMilliseconds(300))
+        {
+            Assert.Equal(data, Client.T_O_IOData[..4]);
+            Assert.Equal(stamp, Client.LastReceivedImplicitMessage);
+            await Task.Delay(5, token);
+        }
+
+        byte[] sentinel = [0x5E, 0x47, 0x1E, 0x10];
+        await SendToOriginatorAsync(BuildTOPacket(ConnectionIdTO, sentinel, sentinelSequence), token);
+        Assert.True(SpinWait.SpinUntil(() => Client.T_O_IOData[..4].SequenceEqual(sentinel), Timeout),
+            "the sentinel packet behind the ignored one was never handled: the receive loop no longer processes packets");
+    }
 
     /// <summary>Receives the next O-to-T packet the client produces.</summary>
     public async Task<byte[]> ReceiveFromOriginatorAsync(CancellationToken token)

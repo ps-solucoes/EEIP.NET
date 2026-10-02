@@ -7,12 +7,14 @@ namespace Sres.Net.EEIP
     /// <summary>
     /// Sleeps with sub-millisecond resolution. Thread.Sleep and WaitOne only take whole milliseconds and on Windows
     /// round up to the timer tick (15.6 ms by default), which is useless for packet rates of a few milliseconds.
-    /// Windows: a high-resolution waitable timer (Windows 10 1803 and later). Linux/macOS: nanosleep.
+    /// Windows: a high-resolution waitable timer (Windows 10 1803 and later); before that only the timer resolution is raised
+    /// to 1 ms for the lifetime of the instance, so that whole millisecond waits take about a millisecond. Linux/macOS: nanosleep.
     /// Not thread safe: one instance per thread.
     /// </summary>
     internal sealed class PreciseSleeper : IDisposable
     {
         private IntPtr timer;
+        private bool raisedTimerResolution;
 
         /// <summary>false where no high-resolution sleep is available (Windows before 1803): Sleep must not be called</summary>
         public bool IsPrecise { get; }
@@ -23,6 +25,8 @@ namespace Sres.Net.EEIP
             {
                 timer = CreateWaitableTimerExW(IntPtr.Zero, IntPtr.Zero, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
                 IsPrecise = timer != IntPtr.Zero;
+                if (!IsPrecise)
+                    raisedTimerResolution = timeBeginPeriod(1) == 0;
             }
             else
                 IsPrecise = OperatingSystem.IsLinux() || OperatingSystem.IsMacOS() || OperatingSystem.IsFreeBSD();
@@ -54,6 +58,11 @@ namespace Sres.Net.EEIP
                 CloseHandle(timer);
                 timer = IntPtr.Zero;
             }
+            if (raisedTimerResolution)
+            {
+                timeEndPeriod(1);
+                raisedTimerResolution = false;
+            }
         }
 
         private const uint CREATE_WAITABLE_TIMER_HIGH_RESOLUTION = 0x00000002;
@@ -78,6 +87,12 @@ namespace Sres.Net.EEIP
 
         [DllImport("kernel32", SetLastError = true)]
         private static extern int CloseHandle(IntPtr handle);
+
+        [DllImport("winmm")]
+        private static extern uint timeBeginPeriod(uint milliseconds);
+
+        [DllImport("winmm")]
+        private static extern uint timeEndPeriod(uint milliseconds);
 
         [DllImport("libc", SetLastError = true)]
         private static extern int nanosleep(ref Timespec request, IntPtr remaining);

@@ -327,7 +327,14 @@ namespace Sres.Net.EEIP
         }
 
         System.Net.Sockets.UdpClient udpClientReceive;
-        System.Threading.CancellationTokenSource sendCancellation;
+        Class1Sender sender;
+
+        /// <summary>The state of the O->T send thread of one connection; the thread only ever touches its own</summary>
+        private sealed class Class1Sender
+        {
+            public readonly System.Threading.CancellationTokenSource Cancellation = new System.Threading.CancellationTokenSource();
+            public volatile Exception SendException;
+        }
         public void ForwardOpen(bool largeForwardOpen)
         {
             //One connection per client: a second one would take over the connection IDs and orphan the first one's threads and socket
@@ -337,7 +344,47 @@ namespace Sres.Net.EEIP
                 throw new InvalidOperationException("RequestedPacketRate_O_T must not be 0");
             if (O_T_Length > _O_T_IOData.Length)
                 throw new InvalidOperationException("O_T_Length is " + O_T_Length + ", at most " + _O_T_IOData.Length + " bytes are supported");
+            if (T_O_Length > _T_O_IOData.Length)
+                throw new InvalidOperationException("T_O_Length is " + T_O_Length + ", at most " + _T_O_IOData.Length + " bytes are supported");
 
+            //The port is taken before the target is asked for a connection: failing afterwards would leave the connection open on the target
+            System.Net.Sockets.UdpClient receiveSocket = new System.Net.Sockets.UdpClient(new System.Net.IPEndPoint(System.Net.IPAddress.Any, OriginatorUDPPort));
+            bool openedOnTarget = false;
+            try
+            {
+                multicastAddress = 0;           //Only what this connection's request and reply say
+                ForwardOpen(largeForwardOpen, receiveSocket, ref openedOnTarget);
+            }
+            catch
+            {
+                receiveSocket.Close();
+                if (openedOnTarget)
+                {
+                    try
+                    {
+                        SendForwardClose();
+                    }
+                    catch (Exception)
+                    {
+                        //The original error is the one to report; the target times the connection out if this didn't get through
+                    }
+                }
+                throw;
+            }
+            udpClientReceive = receiveSocket;
+
+            //Every connection gets its own token and receive loop: a late ForwardClose or a late completion of the previous connection's socket can't touch this one
+            Class1Sender connectionSender = new Class1Sender();
+            sender = connectionSender;
+            System.Threading.Thread sendThread = new System.Threading.Thread(() => sendUDP(connectionSender));
+            sendThread.IsBackground = true;
+            sendThread.Start();
+
+            _ = ReceiveLoopClass1(udpClientReceive);
+        }
+
+        private void ForwardOpen(bool largeForwardOpen, System.Net.Sockets.UdpClient receiveSocket, ref bool openedOnTarget)
+        {
             ushort o_t_headerOffset = 2;                    //Zählt den Sequencecount und evtl 32bit header zu der Länge dazu
             if (O_T_RealTimeFormat == RealTimeFormat.Header32Bit)
                 o_t_headerOffset = 6;
@@ -570,6 +617,7 @@ namespace Sres.Net.EEIP
                     throw new CIPException(GeneralStatusCodes.GetStatusCode(data[42]));
             }
             //--------------------------END Error?
+            openedOnTarget = true;
             if (data.Length < 52)
                 throw new CIPException("Truncated Forward_Open reply: " + data.Length + " bytes");
             //Read the Network ID from the Reply (see 3-3.7.1.1)
@@ -578,17 +626,24 @@ namespace Sres.Net.EEIP
             this.connectionID_O_T = data[44] + (uint)(data[45] << 8) + (uint)(data[46] << 16) + (uint)(data[47] << 24);
             this.connectionID_T_O = data[48] + (uint)(data[49] << 8) + (uint)(data[50] << 16) + (uint)(data[51] << 24);
 
+            //Where the items behind the data item start. Wrong data item lengths are common in devices, but a successful reply
+            //has a known size (26 bytes and the application reply, whose size in words is at byte 68): if no sockaddr info item
+            //is where the length says, but one is where the size says, the size is right
+            int itemsStart = 40 + lengthUnconectedDataItem;
+            if (data.Length >= 70 && !IsSockaddrInfoItemAt(data, itemsStart) && IsSockaddrInfoItemAt(data, 70 + 2 * data[68]))
+                itemsStart = 70 + 2 * data[68];
+
             //Is a SocketInfoItem present?
             int numberOfCurrentItem = 0;
             Encapsulation.SocketAddress socketInfoItem;
-            while (itemCount > 2 && 40 + lengthUnconectedDataItem + 20 * (numberOfCurrentItem + 1) <= data.Length)
+            while (itemCount > 2 && itemsStart + 20 * (numberOfCurrentItem + 1) <= data.Length)
             {
-                int typeID = data[40 + lengthUnconectedDataItem+ 20 * numberOfCurrentItem] + (data[40 + lengthUnconectedDataItem + 1+ 20 * numberOfCurrentItem] << 8);
+                int typeID = data[itemsStart + 20 * numberOfCurrentItem] + (data[itemsStart + 1+ 20 * numberOfCurrentItem] << 8);
                 if (typeID == 0x8001)
                 {
                     socketInfoItem = new Encapsulation.SocketAddress();
-                    socketInfoItem.SIN_Address = BinaryPrimitives.ReadUInt32BigEndian(data.AsSpan(40 + lengthUnconectedDataItem + 8 + 20 * numberOfCurrentItem));
-                    socketInfoItem.SIN_port = (UInt16)((UInt16)(data[40 + lengthUnconectedDataItem + 7 + 20 * numberOfCurrentItem]) + (UInt16)(data[40 + lengthUnconectedDataItem + 6 + 20 * numberOfCurrentItem] << 8));
+                    socketInfoItem.SIN_Address = BinaryPrimitives.ReadUInt32BigEndian(data.AsSpan(itemsStart + 8 + 20 * numberOfCurrentItem));
+                    socketInfoItem.SIN_port = (UInt16)((UInt16)(data[itemsStart + 7 + 20 * numberOfCurrentItem]) + (UInt16)(data[itemsStart + 6 + 20 * numberOfCurrentItem] << 8));
                     if (T_O_ConnectionType == ConnectionType.Multicast)
                         multicastAddress = socketInfoItem.SIN_Address;
                     TargetUDPPort = socketInfoItem.SIN_port;
@@ -596,38 +651,20 @@ namespace Sres.Net.EEIP
                 numberOfCurrentItem++;
                 itemCount--;
             }
-            //Open UDP-Port
-
-
-
-            System.Net.IPEndPoint endPointReceive = new System.Net.IPEndPoint(System.Net.IPAddress.Any, OriginatorUDPPort);
-            System.Net.Sockets.UdpClient receiveSocket = new System.Net.Sockets.UdpClient(endPointReceive);
-            try
+            if (multicastAddress != 0)
             {
-                if (multicastAddress != 0)
-                {
-                    byte[] multicastBytes = new byte[4];
-                    BinaryPrimitives.WriteUInt32BigEndian(multicastBytes, multicastAddress);
-                    System.Net.IPAddress multicast = new System.Net.IPAddress(multicastBytes);
-                    receiveSocket.JoinMulticastGroup(multicast);
-                }
+                byte[] multicastBytes = new byte[4];
+                BinaryPrimitives.WriteUInt32BigEndian(multicastBytes, multicastAddress);
+                receiveSocket.JoinMulticastGroup(new System.Net.IPAddress(multicastBytes));
             }
-            catch
-            {
-                receiveSocket.Close();
-                throw;
-            }
-            udpClientReceive = receiveSocket;
+        }
 
-            //Every connection gets its own token and receive loop: a late ForwardClose or a late completion of the previous connection's socket can't touch this one
-            ImplicitSendException = null;
-            sendCancellation = new System.Threading.CancellationTokenSource();
-            System.Threading.CancellationToken stopSending = sendCancellation.Token;
-            System.Threading.Thread sendThread = new System.Threading.Thread(() => sendUDP(stopSending));
-            sendThread.IsBackground = true;
-            sendThread.Start();
-
-            _ = ReceiveLoopClass1(udpClientReceive);
+        private static bool IsSockaddrInfoItemAt(byte[] data, int offset)
+        {
+            if (offset < 0 || offset + 20 > data.Length)
+                return false;
+            int typeID = data[offset] | data[offset + 1] << 8;
+            return typeID == 0x8000 || typeID == 0x8001;
         }
 
         public void LargeForwardOpen()
@@ -705,10 +742,26 @@ namespace Sres.Net.EEIP
         public void ForwardClose()
         {
             //First stop the Thread which send data
+            sender?.Cancellation.Cancel();
+            try
+            {
+                SendForwardClose();
+            }
+            finally
+            {
+                //Close the Socket for Receive, whatever the target answered: it ends the receive loop and frees the port
+                udpClientReceive?.Close();
+                udpClientReceive = null;
+            }
+        }
 
-            sendCancellation?.Cancel();
-
-
+        /// <summary>
+        /// Sends the Forward_Close request for the connection opened last and reads the reply. A connection that was closed
+        /// by the target already (no reply) is not an error.
+        /// </summary>
+        /// <exception cref="CIPException">The target answered with an error</exception>
+        private void SendForwardClose()
+        {
             int lengthOffset = (5 + (O_T_ConnectionType == ConnectionType.Null ? 0 : 2) + (T_O_ConnectionType == ConnectionType.Null ? 0 : 2));
 
             Encapsulation encapsulation = new Encapsulation();
@@ -818,56 +871,46 @@ namespace Sres.Net.EEIP
             {
                 //Handle Exception  to allow Forward close if the connection was closed by the Remote Device before
             }
+            byte[] data = null;
             try
             {
-                byte[] data = null;
-                try
-                {
-                    data = ReadSendRRDataReply();
-                }
-                catch (Exception e) when (e is not CIPException)
-                {
-                    //Handle Exception  to allow Forward close if the connection was closed by the Remote Device before
-                }
-
-                //--------------------------BEGIN Error?
-                if (data != null && data[42] != 0)      //Exception codes see "Table B-1.1 CIP General Status Codes"
-                {
-                    throw new CIPException(GeneralStatusCodes.GetStatusCode(data[42]));
-                }
+                data = ReadSendRRDataReply();
             }
-            finally
+            catch (Exception e) when (e is not CIPException)
             {
-                //Close the Socket for Receive, whatever the target answered: it ends the receive loop and frees the port
-                udpClientReceive?.Close();
-                udpClientReceive = null;
+                //Handle Exception  to allow Forward close if the connection was closed by the Remote Device before
+            }
+
+            //--------------------------BEGIN Error?
+            if (data != null && data[42] != 0)      //Exception codes see "Table B-1.1 CIP General Status Codes"
+            {
+                throw new CIPException(GeneralStatusCodes.GetStatusCode(data[42]));
             }
         }
 
         /// <summary>
-        /// The exception that stopped sending the Originator -> Target data of the current connection (e.g. the network went away);
-        /// null while it is being sent. The connection stays open until ForwardClose, but the target will time it out.
+        /// Why the last Originator -> Target packet of the current (or last closed) connection could not be sent, e.g. the network
+        /// is gone; null once a packet goes out again. Sending carries on at the packet rate meanwhile, but if it fails for longer
+        /// than the connection timeout the target closes the connection. Not cleared by ForwardClose, only by the next ForwardOpen.
         /// </summary>
-        public Exception ImplicitSendException { get; private set; }
+        public Exception ImplicitSendException => sender?.SendException;
 
-        private void sendUDP(System.Threading.CancellationToken stop)
+        private void sendUDP(Class1Sender state)
         {
             //Runs on its own thread: an exception escaping it would terminate the process
             try
             {
-                SendLoopClass1(stop);
+                SendLoopClass1(state);
             }
-            catch (Exception e) when (!stop.IsCancellationRequested)
+            catch (Exception e)
             {
-                ImplicitSendException = e;          //Only while this connection is open: after ForwardClose it would be reported on the next one
-            }
-            catch (Exception)
-            {
+                state.SendException = e;            //The setup failed: nothing can be sent for this connection
             }
         }
 
-        private void SendLoopClass1(System.Threading.CancellationToken stop)
+        private void SendLoopClass1(Class1Sender state)
         {
+            System.Threading.CancellationToken stop = state.Cancellation.Token;
             System.Net.IPEndPoint endPointsend = new System.Net.IPEndPoint(System.Net.IPAddress.Parse(IPAddress), TargetUDPPort);
             System.Net.SocketAddress targetAddress = endPointsend.Serialize();     //Serialized once, so that sending does not allocate
             using PreciseSleeper sleeper = new PreciseSleeper();
@@ -925,14 +968,25 @@ namespace Sres.Net.EEIP
                     o_t_IOData[19] = (byte)(sequenceCount >> 8);
                 }
 
-                //---------------Write data
-                lock (_O_T_IOData_lock)
+                //A failed packet (the network is briefly gone, no buffer space, ...) is reported and the next one sent on time:
+                //stopping would let the target time the connection out even when the network is back
+                try
                 {
-                    Array.Copy(_O_T_IOData, 0, o_t_IOData, 20 + headerOffset, dataLength);
-                }
-                //---------------Write data
+                    //---------------Write data
+                    lock (_O_T_IOData_lock)
+                    {
+                        Array.Copy(_O_T_IOData, 0, o_t_IOData, 20 + headerOffset, dataLength);
+                    }
+                    //---------------Write data
 
-                udpSend.SendTo(o_t_IOData, System.Net.Sockets.SocketFlags.None, targetAddress);
+                    udpSend.SendTo(o_t_IOData, System.Net.Sockets.SocketFlags.None, targetAddress);
+                    if (state.SendException != null)
+                        state.SendException = null;
+                }
+                catch (Exception e)
+                {
+                    state.SendException = e;
+                }
 
                 //Absolute deadlines, so that the time spent building and sending a packet (and sleeping too long) does not add up to the interval
                 nextSend += interval;
@@ -946,7 +1000,8 @@ namespace Sres.Net.EEIP
 
         /// <summary>
         /// Waits until <paramref name="deadline"/> (a <see cref="Stopwatch"/> timestamp) or until <paramref name="stop"/> is cancelled.
-        /// Sleeps in slices of at most 10 ms (the latency of a cancellation) and spins only the last few microseconds.
+        /// With a precise sleeper it sleeps in slices of at most 10 ms (the latency of a cancellation) and spins only the last few
+        /// microseconds; without one it sleeps whole milliseconds and may return up to one early.
         /// </summary>
         /// <returns>false if cancelled</returns>
         private static bool WaitUntil(long deadline, System.Threading.CancellationToken stop, PreciseSleeper sleeper)
@@ -964,15 +1019,13 @@ namespace Sres.Net.EEIP
                     sleeper.Sleep(Math.Min(remaining - spinTicks, sliceTicks));
                 else
                 {
-                    //Whole milliseconds only (and the timer tick on Windows): sleep while a millisecond is left, yield after that
+                    //Whole milliseconds only (Windows before 1803, where PreciseSleeper raised the timer resolution to 1 ms): the
+                    //sub-millisecond rest is jitter, not worth a busy core. The deadlines are absolute, so the rate stays right
                     long remainingMilliseconds = remaining * 1000 / Stopwatch.Frequency;
-                    if (remainingMilliseconds >= 2)
-                    {
-                        if (stop.WaitHandle.WaitOne((int)Math.Min(remainingMilliseconds - 1, 10)))
-                            return false;
-                    }
-                    else
-                        System.Threading.Thread.Sleep(0);
+                    if (remainingMilliseconds == 0)
+                        return true;
+                    if (stop.WaitHandle.WaitOne((int)remainingMilliseconds))
+                        return false;
                 }
             }
             return false;

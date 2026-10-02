@@ -16,7 +16,6 @@ namespace EEIP.NET.Tests.SuspectedBugs;
 [Collection(NonParallelCollection.Name)]
 public sealed class Issue6ReviewFindingsTests
 {
-    private static readonly byte[] Zeros = new byte[4];
     private static readonly byte[] First = [0xA1, 0xA2, 0xA3, 0xA4];
     private static readonly byte[] Second = [0xB1, 0xB2, 0xB3, 0xB4];
 
@@ -118,8 +117,7 @@ public sealed class Issue6ReviewFindingsTests
         {
             await harness.SendToOriginatorAsync(ImplicitHarness.BuildTOPacket(ImplicitHarness.ConnectionIdTO, First, sequence: 5), TestContext.Current.CancellationToken);
             WaitForData(harness.Client, First);
-            await Task.Delay(100, TestContext.Current.CancellationToken);
-            var stampOfLastAcceptedPacket = harness.Client.LastReceivedImplicitMessage;
+            await Task.Delay(100, TestContext.Current.CancellationToken);     //LastReceivedImplicitMessage is stamped right after the data
 
             byte[] rejected = kind switch
             {
@@ -131,11 +129,7 @@ public sealed class Issue6ReviewFindingsTests
                 "oversized" => ImplicitHarness.BuildTOPacket(ImplicitHarness.ConnectionIdTO, new byte[600], sequence: 6),
                 _ => throw new ArgumentOutOfRangeException(nameof(kind)),
             };
-            await harness.SendToOriginatorAsync(rejected, TestContext.Current.CancellationToken);
-            await Task.Delay(300, TestContext.Current.CancellationToken);
-
-            Assert.Equal(First, Head(harness.Client));
-            Assert.Equal(stampOfLastAcceptedPacket, harness.Client.LastReceivedImplicitMessage);
+            await harness.SendAndAssertIgnoredAsync(rejected, sentinelSequence: 7);
         }
         finally
         {
@@ -153,7 +147,7 @@ public sealed class Issue6ReviewFindingsTests
         using var harness = new ImplicitHarness();
         var client = harness.Client;
         client.ForwardOpen();
-        var firstSender = GetPrivate<CancellationTokenSource>(client, "sendCancellation");
+        var firstSender = GetPrivate<object>(client, "sender");
         var firstReceiver = GetPrivate<UdpClient>(client, "udpClientReceive");
         try
         {
@@ -177,7 +171,7 @@ public sealed class Issue6ReviewFindingsTests
         }
         finally
         {
-            firstSender.Cancel();       // whatever the client lost track of
+            ((CancellationTokenSource)firstSender.GetType().GetField("Cancellation")!.GetValue(firstSender)!).Cancel();     // whatever the client lost track of
             firstReceiver.Close();
             harness.TryForwardClose();
         }
