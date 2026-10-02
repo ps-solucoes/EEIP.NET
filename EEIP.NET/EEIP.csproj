@@ -9,6 +9,12 @@
     <Copyright>Copyright © 2018-2020</Copyright>
     <PackageTags>Ethernet/IP EIP EEIP</PackageTags>
     <PackageLicenseExpression>MIT</PackageLicenseExpression>
+    <!-- Links the package to this repo on GitHub Packages; SourceLink (in the SDK) stamps the commit. -->
+    <RepositoryUrl>https://github.com/ps-solucoes/EEIP.NET</RepositoryUrl>
+    <RepositoryType>git</RepositoryType>
+    <PublishRepositoryUrl>true</PublishRepositoryUrl>
+    <IncludeSymbols>true</IncludeSymbols>
+    <SymbolPackageFormat>snupkg</SymbolPackageFormat>
   </PropertyGroup>
   <ItemGroup>
     <InternalsVisibleTo Include="EEIP.NET.Tests" />
