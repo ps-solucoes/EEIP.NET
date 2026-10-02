@@ -1,6 +1,7 @@
 ﻿using System;
 using System.Buffers.Binary;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.Linq;
 using System.Net.NetworkInformation;
 using System.Net.Sockets;
@@ -287,10 +288,9 @@ namespace Sres.Net.EEIP
         }
 
         System.Net.Sockets.UdpClient udpClientReceive;
-        bool udpClientReceiveClosed = false;
+        System.Threading.CancellationTokenSource sendCancellation;
         public void ForwardOpen(bool largeForwardOpen)
         {
-            udpClientReceiveClosed = false;
             ushort o_t_headerOffset = 2;                    //Zählt den Sequencecount und evtl 32bit header zu der Länge dazu
             if (O_T_RealTimeFormat == RealTimeFormat.Header32Bit)
                 o_t_headerOffset = 6;
@@ -555,9 +555,6 @@ namespace Sres.Net.EEIP
 
             System.Net.IPEndPoint endPointReceive = new System.Net.IPEndPoint(System.Net.IPAddress.Any, OriginatorUDPPort);
             udpClientReceive = new System.Net.Sockets.UdpClient(endPointReceive);
-            UdpState s = new UdpState();
-            s.e = endPointReceive;
-            s.u = udpClientReceive;
             if (multicastAddress != 0)
             {
                 byte[] multicastBytes = new byte[4];
@@ -567,10 +564,14 @@ namespace Sres.Net.EEIP
               
             }
 
-            System.Threading.Thread sendThread = new System.Threading.Thread(sendUDP);
+            //Every connection gets its own token and receive loop: a late ForwardClose or a late completion of the previous connection's socket can't touch this one
+            sendCancellation = new System.Threading.CancellationTokenSource();
+            System.Threading.CancellationToken stopSending = sendCancellation.Token;
+            System.Threading.Thread sendThread = new System.Threading.Thread(() => sendUDP(stopSending));
+            sendThread.IsBackground = true;
             sendThread.Start();
 
-            var asyncResult = udpClientReceive.BeginReceive(new AsyncCallback(ReceiveCallbackClass1), s);
+            _ = ReceiveLoopClass1(udpClientReceive);
         }
 
         public void LargeForwardOpen()
@@ -644,7 +645,7 @@ namespace Sres.Net.EEIP
         {
             //First stop the Thread which send data
 
-            stopUDP = true;
+            sendCancellation?.Cancel();
 
 
             int lengthOffset = (5 + (O_T_ConnectionType == ConnectionType.Null ? 0 : 2) + (T_O_ConnectionType == ConnectionType.Null ? 0 : 2));
@@ -776,7 +777,6 @@ namespace Sres.Net.EEIP
 
 
             //Close the Socket for Receive
-            udpClientReceiveClosed = true;
             udpClientReceive.Close();
   
            
@@ -784,143 +784,172 @@ namespace Sres.Net.EEIP
 
         }
 
-        private bool stopUDP;
-        int sequence = 0;
-        private void sendUDP()
+        private void sendUDP(System.Threading.CancellationToken stop)
         {
-            System.Net.Sockets.UdpClient udpClientsend = new System.Net.Sockets.UdpClient();
-            stopUDP = false;
+            System.Net.IPEndPoint endPointsend = new System.Net.IPEndPoint(System.Net.IPAddress.Parse(IPAddress), TargetUDPPort);
+            System.Net.SocketAddress targetAddress = endPointsend.Serialize();     //Serialized once, so that sending does not allocate
+            using System.Net.Sockets.Socket udpSend = new System.Net.Sockets.Socket(endPointsend.AddressFamily, System.Net.Sockets.SocketType.Dgram, System.Net.Sockets.ProtocolType.Udp);
+
+            ushort headerOffset = 0;
+            if (O_T_RealTimeFormat == RealTimeFormat.Header32Bit)
+                headerOffset = 4;
+            int dataLength = O_T_Length;
+            ushort o_t_Length = (ushort)(dataLength + headerOffset + 2);   //Modeless and zero Length
+            byte[] o_t_IOData = new byte[20 + headerOffset + dataLength];
+
+            //The packet is built once, only the sequence counts and the data change from packet to packet
+            //---------------Item count
+            o_t_IOData[0] = 2;
+            o_t_IOData[1] = 0;
+            //---------------Type ID
+            o_t_IOData[2] = 0x02;
+            o_t_IOData[3] = 0x80;
+            //---------------Length
+            o_t_IOData[4] = 0x08;
+            o_t_IOData[5] = 0x00;
+            //---------------connection ID
+            o_t_IOData[6] = (byte)(connectionID_O_T);
+            o_t_IOData[7] = (byte)(connectionID_O_T >> 8);
+            o_t_IOData[8] = (byte)(connectionID_O_T >> 16);
+            o_t_IOData[9] = (byte)(connectionID_O_T >> 24);
+            //---------------Type ID
+            o_t_IOData[14] = 0xB1;
+            o_t_IOData[15] = 0x00;
+            //---------------Length
+            o_t_IOData[16] = (byte)o_t_Length;
+            o_t_IOData[17] = (byte)(o_t_Length >> 8);
+            //---------------32 bit Real Time Header (run)
+            if (O_T_RealTimeFormat == RealTimeFormat.Header32Bit)
+                o_t_IOData[20] = 1;
+
+            //The requested packet rate is in microseconds
+            long interval = (long)(RequestedPacketRate_O_T * (double)Stopwatch.Frequency / 1_000_000);
+            long nextSend = Stopwatch.GetTimestamp();
             uint sequenceCount = 0;
 
-
-            while (!stopUDP)
+            while (!stop.IsCancellationRequested)
             {
-                byte[] o_t_IOData = new byte[564];
-                System.Net.IPEndPoint endPointsend = new System.Net.IPEndPoint(System.Net.IPAddress.Parse(IPAddress), TargetUDPPort);
-               
-                UdpState send = new UdpState();
-                 
-                //---------------Item count
-                o_t_IOData[0] = 2;
-                o_t_IOData[1] = 0;
-                //---------------Item count
-
-                //---------------Type ID
-                o_t_IOData[2] = 0x02;
-                o_t_IOData[3] = 0x80;
-                //---------------Type ID
-
-                //---------------Length
-                o_t_IOData[4] = 0x08;
-                o_t_IOData[5] = 0x00;
-                //---------------Length
-
-                //---------------connection ID
                 sequenceCount++;
-                o_t_IOData[6] = (byte)(connectionID_O_T);
-                o_t_IOData[7] = (byte)(connectionID_O_T >> 8); 
-                o_t_IOData[8] = (byte)(connectionID_O_T >> 16); 
-                o_t_IOData[9] = (byte)(connectionID_O_T >> 24);
-                //---------------connection ID     
-
                 //---------------sequence count
                 o_t_IOData[10] = (byte)(sequenceCount);
                 o_t_IOData[11] = (byte)(sequenceCount >> 8);
                 o_t_IOData[12] = (byte)(sequenceCount >> 16);
                 o_t_IOData[13] = (byte)(sequenceCount >> 24);
-                //---------------sequence count            
-
-                //---------------Type ID
-                o_t_IOData[14] = 0xB1;
-                o_t_IOData[15] = 0x00;
-                //---------------Type ID
-
-                ushort headerOffset = 0;
-                if (O_T_RealTimeFormat == RealTimeFormat.Header32Bit)
-                    headerOffset = 4;
-                if (O_T_RealTimeFormat == RealTimeFormat.Heartbeat)
-                    headerOffset = 0;
-                ushort o_t_Length = (ushort)(O_T_Length + headerOffset+2);   //Modeless and zero Length
-
-                //---------------Length
-                o_t_IOData[16] = (byte)o_t_Length;
-                o_t_IOData[17] = (byte)(o_t_Length >> 8);
-                //---------------Length
-
                 //---------------Sequence count
-                sequence++;
                 if (O_T_RealTimeFormat != RealTimeFormat.Heartbeat)
                 {
-                    o_t_IOData[18] = (byte)sequence;
-                    o_t_IOData[19] = (byte)(sequence >> 8);
-                }
-                //---------------Sequence count
-
-                if (O_T_RealTimeFormat == RealTimeFormat.Header32Bit)
-                {
-                    o_t_IOData[20] = (byte)1;
-                    o_t_IOData[21] = (byte)0;
-                    o_t_IOData[22] = (byte)0;
-                    o_t_IOData[23] = (byte)0;
-
+                    o_t_IOData[18] = (byte)sequenceCount;
+                    o_t_IOData[19] = (byte)(sequenceCount >> 8);
                 }
 
                 //---------------Write data
                 lock (_O_T_IOData_lock)
                 {
-                    Array.Copy(_O_T_IOData, 0, o_t_IOData, 20 + headerOffset, O_T_Length);
+                    Array.Copy(_O_T_IOData, 0, o_t_IOData, 20 + headerOffset, dataLength);
                 }
                 //---------------Write data
 
+                udpSend.SendTo(o_t_IOData, System.Net.Sockets.SocketFlags.None, targetAddress);
 
-
-
-                udpClientsend.Send(o_t_IOData, O_T_Length+20+headerOffset, endPointsend);
-                System.Threading.Thread.Sleep((int)RequestedPacketRate_O_T/1000);
-
+                //Absolute deadlines, so that the time spent building and sending a packet (and sleeping too long) does not add up to the interval
+                nextSend += interval;
+                long now = Stopwatch.GetTimestamp();
+                if (nextSend < now - interval)      //More than one packet behind: carry on from now instead of sending a burst
+                    nextSend = now;
+                if (!WaitUntil(nextSend, stop))
+                    break;
             }
-
-            udpClientsend.Close();
-
         }
 
-        private void ReceiveCallbackClass1(IAsyncResult ar)
-        {          
-            UdpClient u = (UdpClient)((UdpState)(ar.AsyncState)).u;
-            if (udpClientReceiveClosed)
+        /// <summary>
+        /// Waits until <paramref name="deadline"/> (a <see cref="Stopwatch"/> timestamp) or until <paramref name="stop"/> is cancelled.
+        /// Sleeping is only accurate to about a millisecond, so the last bit is spun out, which is the only way to
+        /// keep an interval below a few milliseconds. Long intervals just sleep: a little jitter is better than a busy core.
+        /// </summary>
+        /// <returns>false if cancelled</returns>
+        private static bool WaitUntil(long deadline, System.Threading.CancellationToken stop)
+        {
+            long remainingMilliseconds = (deadline - Stopwatch.GetTimestamp()) * 1000 / Stopwatch.Frequency;
+            long sleepMilliseconds = remainingMilliseconds >= 5 ? remainingMilliseconds : remainingMilliseconds - 1;
+            if (sleepMilliseconds > 0 && stop.WaitHandle.WaitOne((int)sleepMilliseconds))
+                return false;
+
+            System.Threading.SpinWait spinner = new System.Threading.SpinWait();
+            while (Stopwatch.GetTimestamp() < deadline)
+            {
+                if (stop.IsCancellationRequested)
+                    return false;
+                spinner.SpinOnce(-1);       //Never sleeps, only spins and yields
+            }
+            return !stop.IsCancellationRequested;
+        }
+
+        /// <summary>
+        /// Receives the class 1 T->O packets of one connection until its socket is closed (ForwardClose).
+        /// Packets are handled one at a time and in order; nothing a packet contains can end the loop.
+        /// </summary>
+        private async System.Threading.Tasks.Task ReceiveLoopClass1(UdpClient socket)
+        {
+            bool sequenceKnown = false;
+            ushort lastSequence = 0;
+            while (true)
+            {
+                byte[] receiveBytes;
+                try
+                {
+                    receiveBytes = (await socket.ReceiveAsync().ConfigureAwait(false)).Buffer;
+                }
+                catch (ObjectDisposedException)
+                {
+                    return;                     //Closed by ForwardClose
+                }
+                catch (SocketException e) when (e.SocketErrorCode == SocketError.ConnectionReset)
+                {
+                    continue;                   //ICMP "port unreachable" for an earlier send (Windows), not the end of the socket
+                }
+                catch (SocketException)
+                {
+                    return;                     //Closed by ForwardClose (operation aborted) or unusable
+                }
+                HandleClass1Packet(receiveBytes, ref sequenceKnown, ref lastSequence);
+                LastReceivedImplicitMessage = DateTime.Now;
+            }
+        }
+
+        private void HandleClass1Packet(byte[] receiveBytes, ref bool sequenceKnown, ref ushort lastSequence)
+        {
+            ushort headerOffset = 0;
+            if (T_O_RealTimeFormat == RealTimeFormat.Header32Bit)
+                headerOffset = 4;
+
+            //20 bytes: item count, sequenced address item (with connection ID and sequence number), connected data item header and its sequence count
+            if (receiveBytes.Length < 20 + headerOffset)
                 return;
 
-            u.BeginReceive(new AsyncCallback(ReceiveCallbackClass1), (UdpState)(ar.AsyncState));
-            System.Net.IPEndPoint e = (System.Net.IPEndPoint)((UdpState)(ar.AsyncState)).e;
+            //Get the connection ID
+            uint connectionID = (uint)(receiveBytes[6] | receiveBytes[7] << 8 | receiveBytes[8] << 16 | receiveBytes[9] << 24);
+            if (connectionID != connectionID_T_O)
+                return;
 
+            //The data must be in a connected data item (0x00B1)
+            if ((receiveBytes[14] | receiveBytes[15] << 8) != 0xB1)
+                return;
 
-            Byte[] receiveBytes = u.EndReceive(ar, ref e);
+            int dataLength = receiveBytes.Length - 20 - headerOffset;
+            if (dataLength > _T_O_IOData.Length)
+                return;
 
-            // EndReceive worked and we have received data and remote endpoint
+            //Ignore duplicates and old packets: only a count that is "ahead" of the last one (modulo 2^16) is new
+            ushort sequence = (ushort)(receiveBytes[18] | receiveBytes[19] << 8);
+            if (sequenceKnown && (short)(sequence - lastSequence) <= 0)
+                return;
+            sequenceKnown = true;
+            lastSequence = sequence;
 
-            if (receiveBytes.Length > 20)
+            lock (_T_O_IOData_lock)
             {
-                //Get the connection ID
-                uint connectionID = (uint)(receiveBytes[6] | receiveBytes[7] << 8 | receiveBytes[8] << 16 | receiveBytes[9] << 24);
-
-
-                if (connectionID == connectionID_T_O)
-                {
-                    ushort headerOffset = 0;
-                    if (T_O_RealTimeFormat == RealTimeFormat.Header32Bit)
-                        headerOffset = 4;
-                    if (T_O_RealTimeFormat == RealTimeFormat.Heartbeat)
-                        headerOffset = 0;
-
-                    lock (_T_O_IOData_lock)
-                    {
-                        Array.Copy(receiveBytes, 20 + headerOffset, _T_O_IOData, 0,
-                            receiveBytes.Length - 20 - headerOffset);
-                    }
-                    //Console.WriteLine(T_O_IOData[0]);
-                }
+                Array.Copy(receiveBytes, 20 + headerOffset, _T_O_IOData, 0, dataLength);
             }
-            LastReceivedImplicitMessage = DateTime.Now;
         }
 
 
