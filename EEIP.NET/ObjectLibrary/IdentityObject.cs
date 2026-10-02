@@ -122,8 +122,10 @@ namespace Sres.Net.EEIP.ObjectLibrary
             get
             {
                 byte[] byteArray = eeipClient.GetAttributeSingle(1, 1, 7);
-                String returnValue = Encoding.UTF8.GetString(byteArray);
-                return returnValue;
+                // SHORT_STRING: one length byte followed by the characters
+                if (byteArray.Length == 0)
+                    return string.Empty;
+                return Encoding.UTF8.GetString(byteArray, 1, Math.Min(byteArray[0], byteArray.Length - 1));
             }
         }
 
