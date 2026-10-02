@@ -1,4 +1,5 @@
 ﻿using System;
+using System.Buffers.Binary;
 using System.Collections.Generic;
 using System.Linq;
 using System.Net.NetworkInformation;
@@ -242,14 +243,18 @@ namespace Sres.Net.EEIP
             client = new TcpClient(ipAddress, port);
             stream = client.GetStream();
 
-            stream.Write(encapsulation.toBytes(), 0, encapsulation.toBytes().Length);
-            byte[] data = new Byte[256];
-
-            Int32 bytes = stream.Read(data, 0, data.Length);
-
-            UInt32 returnvalue = (UInt32)data[4] + (((UInt32)data[5]) << 8) + (((UInt32)data[6]) << 16) + (((UInt32)data[7]) << 24);
-            this.sessionHandle = returnvalue;
-            return returnvalue;
+            try
+            {
+                stream.Write(encapsulation.toBytes(), 0, encapsulation.toBytes().Length);
+                byte[] data = ReadEncapsulationFrame();
+                this.sessionHandle = BinaryPrimitives.ReadUInt32LittleEndian(data.AsSpan(4));
+            }
+            catch
+            {
+                client.Close();
+                throw;
+            }
+            return this.sessionHandle;
         }
 
         /// <summary>
@@ -486,7 +491,7 @@ namespace Sres.Net.EEIP
                 commonPacketFormat.SocketaddrInfo_O_T.SIN_family = 2;
             if (O_T_ConnectionType == ConnectionType.Multicast)
             {
-                UInt32 multicastResponseAddress = EEIPClient.GetMulticastAddress(BitConverter.ToUInt32(System.Net.IPAddress.Parse(IPAddress).GetAddressBytes(), 0));
+                UInt32 multicastResponseAddress = EEIPClient.GetMulticastAddress(BinaryPrimitives.ReadUInt32BigEndian(System.Net.IPAddress.Parse(IPAddress).GetAddressBytes()));
 
                 commonPacketFormat.SocketaddrInfo_O_T.SIN_Address = (multicastResponseAddress);
 
@@ -504,15 +509,13 @@ namespace Sres.Net.EEIP
             //encapsulation.toBytes();
             
             stream.Write(dataToWrite, 0, dataToWrite.Length);
-            byte[] data = new Byte[564];
-
-            Int32 bytes = stream.Read(data, 0, data.Length);
+            byte[] data = ReadSendRRDataReply();
 
             //--------------------------BEGIN Error?
             if (data[42] != 0)      //Exception codes see "Table B-1.1 CIP General Status Codes"
             {
                 if (data[42] == 0x1)
-                    if (data[43] == 0)
+                    if (data[43] == 0 || data.Length < 46)
                         throw new CIPException("Connection failure, General Status Code: " + data[42]);
                     else
                         throw new CIPException("Connection failure, General Status Code: " + data[42] + " Additional Status Code: " + ((data[45] << 8) | data[44]) + " " + ObjectLibrary.ConnectionManagerObject.GetExtendedStatus((uint)((data[45] << 8) | data[44])));
@@ -520,6 +523,8 @@ namespace Sres.Net.EEIP
                     throw new CIPException(GeneralStatusCodes.GetStatusCode(data[42]));
             }
             //--------------------------END Error?
+            if (data.Length < 52)
+                throw new CIPException("Truncated Forward_Open reply: " + data.Length + " bytes");
             //Read the Network ID from the Reply (see 3-3.7.1.1)
             int itemCount = data[30] + (data[31] << 8);
             int lengthUnconectedDataItem = data[38] + (data[39] << 8);
@@ -529,13 +534,13 @@ namespace Sres.Net.EEIP
             //Is a SocketInfoItem present?
             int numberOfCurrentItem = 0;
             Encapsulation.SocketAddress socketInfoItem;
-            while (itemCount > 2)
+            while (itemCount > 2 && 40 + lengthUnconectedDataItem + 20 * (numberOfCurrentItem + 1) <= data.Length)
             {
                 int typeID = data[40 + lengthUnconectedDataItem+ 20 * numberOfCurrentItem] + (data[40 + lengthUnconectedDataItem + 1+ 20 * numberOfCurrentItem] << 8);
                 if (typeID == 0x8001)
                 {
                     socketInfoItem = new Encapsulation.SocketAddress();
-                    socketInfoItem.SIN_Address = (UInt32)(data[40 + lengthUnconectedDataItem + 8 + 20 * numberOfCurrentItem]) + (UInt32)(data[40 + lengthUnconectedDataItem + 9 + 20 * numberOfCurrentItem] << 8) + (UInt32)(data[40 + lengthUnconectedDataItem + 10 + 20 * numberOfCurrentItem] << 16) + (UInt32)(data[40 + lengthUnconectedDataItem + 11 + 20 * numberOfCurrentItem] << 24);
+                    socketInfoItem.SIN_Address = BinaryPrimitives.ReadUInt32BigEndian(data.AsSpan(40 + lengthUnconectedDataItem + 8 + 20 * numberOfCurrentItem));
                     socketInfoItem.SIN_port = (UInt16)((UInt16)(data[40 + lengthUnconectedDataItem + 7 + 20 * numberOfCurrentItem]) + (UInt16)(data[40 + lengthUnconectedDataItem + 6 + 20 * numberOfCurrentItem] << 8));
                     if (T_O_ConnectionType == ConnectionType.Multicast)
                         multicastAddress = socketInfoItem.SIN_Address;
@@ -555,7 +560,9 @@ namespace Sres.Net.EEIP
             s.u = udpClientReceive;
             if (multicastAddress != 0)
             {
-                System.Net.IPAddress multicast = (new System.Net.IPAddress(multicastAddress));
+                byte[] multicastBytes = new byte[4];
+                BinaryPrimitives.WriteUInt32BigEndian(multicastBytes, multicastAddress);
+                System.Net.IPAddress multicast = new System.Net.IPAddress(multicastBytes);
                 udpClientReceive.JoinMulticastGroup(multicast);
               
             }
@@ -749,20 +756,20 @@ namespace Sres.Net.EEIP
             {
                 //Handle Exception  to allow Forward close if the connection was closed by the Remote Device before
             }
-            byte[] data = new Byte[564];
+            byte[] data = null;
 
             try
             {
-                Int32 bytes = stream.Read(data, 0, data.Length);
+                data = ReadSendRRDataReply();
             }
-            catch (Exception e)
+            catch (Exception e) when (e is not CIPException)
             {
                 //Handle Exception  to allow Forward close if the connection was closed by the Remote Device before
             }
 
 
             //--------------------------BEGIN Error?
-            if (data[42] != 0)      //Exception codes see "Table B-1.1 CIP General Status Codes"
+            if (data != null && data[42] != 0)      //Exception codes see "Table B-1.1 CIP General Status Codes"
             {
                 throw new CIPException(GeneralStatusCodes.GetStatusCode(data[42]));
             }
@@ -1015,9 +1022,7 @@ namespace Sres.Net.EEIP
             encapsulation.toBytes();
 
             stream.Write(dataToWrite, 0, dataToWrite.Length);
-            byte[] data = new Byte[564];
-
-            Int32 bytes = stream.Read(data, 0, data.Length);
+            byte[] data = ReadSendRRDataReply();
 
             //--------------------------BEGIN Error?
             if (data[42] != 0)      //Exception codes see "Table B-1.1 CIP General Status Codes"
@@ -1026,8 +1031,7 @@ namespace Sres.Net.EEIP
             }
             //--------------------------END Error?
 
-            byte[] returnData = new byte[bytes - 44];
-            System.Buffer.BlockCopy(data, 44, returnData, 0, bytes-44);
+            byte[] returnData = data.AsSpan(44, 40 + (data[38] | data[39] << 8) - 44).ToArray();
 
             return returnData;
         }
@@ -1096,9 +1100,7 @@ namespace Sres.Net.EEIP
            
 
             stream.Write(dataToWrite, 0, dataToWrite.Length);
-            byte[] data = new Byte[564];
-
-            Int32 bytes = stream.Read(data, 0, data.Length);
+            byte[] data = ReadSendRRDataReply();
             //--------------------------BEGIN Error?
             if (data[42] != 0)      //Exception codes see "Table B-1.1 CIP General Status Codes"
             {
@@ -1106,8 +1108,7 @@ namespace Sres.Net.EEIP
             }
             //--------------------------END Error?
 
-            byte[] returnData = new byte[bytes - 44];
-            System.Buffer.BlockCopy(data, 44, returnData, 0, bytes - 44);
+            byte[] returnData = data.AsSpan(44, 40 + (data[38] | data[39] << 8) - 44).ToArray();
 
             return returnData;
         }
@@ -1180,9 +1181,7 @@ namespace Sres.Net.EEIP
             encapsulation.toBytes();
 
             stream.Write(dataToWrite, 0, dataToWrite.Length);
-            byte[] data = new Byte[564];
-
-            Int32 bytes = stream.Read(data, 0, data.Length);
+            byte[] data = ReadSendRRDataReply();
 
             //--------------------------BEGIN Error?
             if (data[42] != 0)      //Exception codes see "Table B-1.1 CIP General Status Codes"
@@ -1191,10 +1190,61 @@ namespace Sres.Net.EEIP
             }
             //--------------------------END Error?
 
-            byte[] returnData = new byte[bytes - 44];
-            System.Buffer.BlockCopy(data, 44, returnData, 0, bytes - 44);
+            byte[] returnData = data.AsSpan(44, 40 + (data[38] | data[39] << 8) - 44).ToArray();
 
             return returnData;
+        }
+
+        /// <summary>
+        /// Reads one complete encapsulation message: the 24 byte header and, as announced by its length field, the
+        /// body. TCP is a byte stream, so a message may arrive in several pieces and be of any size up to 65559 bytes.
+        /// </summary>
+        /// <returns>Header and body</returns>
+        /// <exception cref="CIPException">The encapsulation status of the reply is not "success"</exception>
+        /// <exception cref="System.IO.IOException">The connection ended before the whole message arrived</exception>
+        private byte[] ReadEncapsulationFrame()
+        {
+            byte[] frame = new byte[24];
+            stream.ReadExactly(frame, 0, 24);
+            int length = BinaryPrimitives.ReadUInt16LittleEndian(frame.AsSpan(2));
+            if (length > 0)
+            {
+                Array.Resize(ref frame, 24 + length);
+                stream.ReadExactly(frame, 24, length);      //Also consumed on an error status, to keep the stream in sync
+            }
+            uint status = BinaryPrimitives.ReadUInt32LittleEndian(frame.AsSpan(8));
+            if (status != 0)
+                throw new CIPException("Encapsulation error, Status Code: 0x" + status.ToString("X2") + " (" + GetEncapsulationStatusText(status) + ")");
+            return frame;
+        }
+
+        /// <summary>
+        /// Reads the reply to a SendRRData command and makes sure that the CIP reply header (general status at byte
+        /// 42, additional status size at byte 43) is there and that the data item fits in the message.
+        /// </summary>
+        private byte[] ReadSendRRDataReply()
+        {
+            byte[] frame = ReadEncapsulationFrame();
+            if (frame.Length < 44)
+                throw new CIPException("Truncated SendRRData reply: " + frame.Length + " bytes");
+            int dataItemEnd = 40 + (frame[38] | frame[39] << 8);
+            if (dataItemEnd < 44 || dataItemEnd > frame.Length)
+                throw new CIPException("Invalid data item length in SendRRData reply");
+            return frame;
+        }
+
+        private static string GetEncapsulationStatusText(uint status)
+        {
+            switch (status)
+            {
+                case 0x01: return "invalid or unsupported command";
+                case 0x02: return "insufficient memory";
+                case 0x03: return "incorrect data";
+                case 0x64: return "invalid session handle";
+                case 0x65: return "invalid length";
+                case 0x69: return "unsupported encapsulation protocol revision";
+                default: return "unknown";
+            }
         }
 
         /// <summary>
