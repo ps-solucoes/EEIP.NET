@@ -110,6 +110,13 @@ namespace Sres.Net.EEIP
             public static CIPIdentityItem getCIPIdentityItem(int startingByte, byte[] receivedData)
             {
                 startingByte = startingByte + 2;            //Skipped ItemCount
+                //Replies come from any host on the network, so nothing is read before it is known to be there: the fixed part
+                //(item type .. length of the product name, 37 bytes), then the product name and the state byte behind it.
+                //The datagram is what is checked, ItemLength is not: devices with a wrong one are common enough
+                if (startingByte < 0 || receivedData.Length < startingByte + 37)
+                    throw new System.IO.InvalidDataException("Truncated CIP Identity item");
+                if (receivedData.Length < startingByte + 38 + receivedData[36 + startingByte])
+                    throw new System.IO.InvalidDataException("Truncated CIP Identity item: product name or state missing");
                 CIPIdentityItem cipIdentityItem = new CIPIdentityItem();
                 cipIdentityItem.ItemTypeCode = Convert.ToUInt16(receivedData[0+startingByte]
                                                                     | (receivedData[1 + startingByte] << 8));
@@ -142,7 +149,7 @@ namespace Sres.Net.EEIP
                                                     | (receivedData[35 + startingByte] << 24));
                 cipIdentityItem.ProductNameLength = receivedData[36 + startingByte];
                 cipIdentityItem.ProductName1 = Encoding.ASCII.GetString(receivedData, 37 + startingByte, cipIdentityItem.ProductNameLength);
-                cipIdentityItem.State1 = receivedData[receivedData.Length - 1];
+                cipIdentityItem.State1 = receivedData[37 + startingByte + cipIdentityItem.ProductNameLength];
                 return cipIdentityItem;
             }
             /// <summary>

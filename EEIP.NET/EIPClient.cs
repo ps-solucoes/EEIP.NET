@@ -145,31 +145,6 @@ namespace Sres.Net.EEIP
             Console.WriteLine();
         }
 
-        private void ReceiveCallback(IAsyncResult ar)
-        {
-            lock (this)
-            {
-                UdpClient u = (UdpClient)((UdpState)(ar.AsyncState)).u;
-                
-                System.Net.IPEndPoint e = (System.Net.IPEndPoint)((UdpState)(ar.AsyncState)).e;
-
-                Byte[] receiveBytes = u.EndReceive(ar, ref e);
-                string receiveString = Encoding.ASCII.GetString(receiveBytes);
-
-                // EndReceive worked and we have received data and remote endpoint
-                if (receiveBytes.Length > 0)
-                {
-                    UInt16 command = Convert.ToUInt16(receiveBytes[0]
-                                                | (receiveBytes[1] << 8));
-                    if (command == 0x63)
-                    {
-                        returnList.Add(Encapsulation.CIPIdentityItem.getCIPIdentityItem(24, receiveBytes));
-                    }
-                }
-                var asyncResult = u.BeginReceive(new AsyncCallback(ReceiveCallback), (UdpState)(ar.AsyncState));
-            }
-
-        }
         public class UdpState
         {
             public System.Net.IPEndPoint e;
@@ -177,47 +152,103 @@ namespace Sres.Net.EEIP
 
         }
 
-        List<Encapsulation.CIPIdentityItem> returnList = new List<Encapsulation.CIPIdentityItem>();
-
         /// <summary>
         /// List and identify potential targets. This command shall be sent as braodcast massage using UDP.
+        /// The broadcast is sent on every interface address at once and the replies are collected for one second.
         /// </summary>
         /// <returns>List<Encapsulation.CIPIdentityItem> contains the received informations from all devices </returns>	
         public List<Encapsulation.CIPIdentityItem> ListIdentity()
         {
-            
-            foreach (NetworkInterface ni in NetworkInterface.GetAllNetworkInterfaces())
+            //A new list for every call: the replies of this call, and nothing that arrives after it returned
+            List<Encapsulation.CIPIdentityItem> returnList = new List<Encapsulation.CIPIdentityItem>();
+            List<UdpClient> sockets = new List<UdpClient>();
+            List<System.Threading.Tasks.Task> receivers = new List<System.Threading.Tasks.Task>();
+            try
             {
-                if ((ni.NetworkInterfaceType == NetworkInterfaceType.Wireless80211 || ni.NetworkInterfaceType == NetworkInterfaceType.Ethernet) && ni.OperationalStatus == OperationalStatus.Up)
+                foreach (NetworkInterface ni in NetworkInterface.GetAllNetworkInterfaces())
                 {
-
-                    foreach (UnicastIPAddressInformation ip in ni.GetIPProperties().UnicastAddresses)
+                    if ((ni.NetworkInterfaceType == NetworkInterfaceType.Wireless80211 || ni.NetworkInterfaceType == NetworkInterfaceType.Ethernet) && ni.OperationalStatus == OperationalStatus.Up)
                     {
-                        if (ip.Address.AddressFamily == System.Net.Sockets.AddressFamily.InterNetwork)
+
+                        foreach (UnicastIPAddressInformation ip in ni.GetIPProperties().UnicastAddresses)
                         {
-                            System.Net.IPAddress mask = ip.IPv4Mask;
-                            System.Net.IPAddress address = ip.Address;
+                            if (ip.Address.AddressFamily == System.Net.Sockets.AddressFamily.InterNetwork)
+                            {
+                                System.Net.IPAddress mask = ip.IPv4Mask;
+                                System.Net.IPAddress address = ip.Address;
 
-                            String multicastAddress = (address.GetAddressBytes()[0] | (~(mask.GetAddressBytes()[0])) & 0xFF).ToString() + "." + (address.GetAddressBytes()[1] | (~(mask.GetAddressBytes()[1])) & 0xFF).ToString() + "." + (address.GetAddressBytes()[2] | (~(mask.GetAddressBytes()[2])) & 0xFF).ToString() + "." + (address.GetAddressBytes()[3] | (~(mask.GetAddressBytes()[3])) & 0xFF).ToString();
+                                String multicastAddress = (address.GetAddressBytes()[0] | (~(mask.GetAddressBytes()[0])) & 0xFF).ToString() + "." + (address.GetAddressBytes()[1] | (~(mask.GetAddressBytes()[1])) & 0xFF).ToString() + "." + (address.GetAddressBytes()[2] | (~(mask.GetAddressBytes()[2])) & 0xFF).ToString() + "." + (address.GetAddressBytes()[3] | (~(mask.GetAddressBytes()[3])) & 0xFF).ToString();
 
-                            byte[] sendData = new byte[24];
-                            sendData[0] = 0x63;               //Command for "ListIdentity"
-                            System.Net.Sockets.UdpClient udpClient = new System.Net.Sockets.UdpClient();
-                            System.Net.IPEndPoint endPoint = new System.Net.IPEndPoint(System.Net.IPAddress.Parse(multicastAddress), 44818);
-                            udpClient.Send(sendData, sendData.Length, endPoint);
+                                byte[] sendData = new byte[24];
+                                sendData[0] = 0x63;               //Command for "ListIdentity"
+                                System.Net.Sockets.UdpClient udpClient = new System.Net.Sockets.UdpClient();
+                                sockets.Add(udpClient);
+                                udpClient.EnableBroadcast = true;       //The directed broadcast address is refused without it (Linux)
+                                System.Net.IPEndPoint endPoint = new System.Net.IPEndPoint(System.Net.IPAddress.Parse(multicastAddress), 44818);
+                                try
+                                {
+                                    udpClient.Send(sendData, sendData.Length, endPoint);
+                                }
+                                catch (SocketException)
+                                {
+                                    continue;       //This interface can't broadcast (e.g. network unreachable), the others still can
+                                }
 
-                            UdpState s = new UdpState();
-                            s.e = endPoint;
-                            s.u = udpClient;
-
-                            var asyncResult = udpClient.BeginReceive(new AsyncCallback(ReceiveCallback), s);
-
-                            System.Threading.Thread.Sleep(1000);
+                                receivers.Add(ReceiveIdentityReplies(udpClient, returnList));
+                            }
                         }
                     }
                 }
+                System.Threading.Thread.Sleep(1000);
+            }
+            finally
+            {
+                //Closing the sockets ends the receivers; once they are done nobody touches the list any more
+                foreach (UdpClient udpClient in sockets)
+                    udpClient.Close();
+                System.Threading.Tasks.Task.WaitAll(receivers.ToArray());
             }
             return returnList;
+        }
+
+        private static async System.Threading.Tasks.Task ReceiveIdentityReplies(UdpClient socket, List<Encapsulation.CIPIdentityItem> returnList)
+        {
+            while (true)
+            {
+                byte[] receiveBytes;
+                try
+                {
+                    receiveBytes = (await socket.ReceiveAsync().ConfigureAwait(false)).Buffer;
+                }
+                catch (ObjectDisposedException)
+                {
+                    return;                     //Closed at the end of ListIdentity
+                }
+                catch (SocketException e) when (e.SocketErrorCode == SocketError.ConnectionReset)
+                {
+                    continue;                   //ICMP "port unreachable" (Windows), not the end of the socket
+                }
+                catch (SocketException)
+                {
+                    return;                     //Closed at the end of ListIdentity (operation aborted) or unusable
+                }
+
+                if (receiveBytes.Length < 2 || (receiveBytes[0] | (receiveBytes[1] << 8)) != 0x63)
+                    continue;
+                Encapsulation.CIPIdentityItem item;
+                try
+                {
+                    item = Encapsulation.CIPIdentityItem.getCIPIdentityItem(24, receiveBytes);
+                }
+                catch (System.IO.InvalidDataException)
+                {
+                    continue;                   //Not a (complete) reply of an EtherNet/IP device, ignore it
+                }
+                lock (returnList)
+                {
+                    returnList.Add(item);
+                }
+            }
         }
 
         /// <summary>
