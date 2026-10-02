@@ -11,6 +11,25 @@ For Data Exchange with Ethernet/IP Devices
 
 <a href="https://sourceforge.net/projects/eeip-net/files/latest/download" rel="nofollow"><img alt="Download EEIP.NET" src="https://a.fsdn.com/con/app/sf-download-button"></a>
 
+### NuGet package (GitHub Packages)
+
+Each GitHub release publishes the `EEIP` package to the `ps-solucoes` GitHub Packages feed. GitHub Packages
+requires authentication even for reads, so restoring needs a personal access token (classic) with the
+`read:packages` scope. Add the feed once, with the token stored in your user-level NuGet config rather than
+in the repository:
+
+```sh
+dotnet nuget add source https://nuget.pkg.github.com/ps-solucoes/index.json \
+  --name ps-solucoes --username <github-user> --password <token> --store-password-in-clear-text
+dotnet add package EEIP
+```
+
+`--store-password-in-clear-text` is required on Linux and macOS, where NuGet cannot encrypt credentials; on
+Windows it can be omitted. In GitHub Actions, the workflow's `GITHUB_TOKEN` (with `packages: read`) can
+replace the personal token once the consuming repository is granted access under the package's
+*Manage Actions access* settings. Symbol packages (`.snupkg`) are attached to each release for step-into
+debugging, since the feed does not host them.
+
 ## Usage
 
 ### Explicit Messaging: Write digital outputs to Ethernet/IP Device
